@@ -155,13 +155,15 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
-    // Values below 0x10000 are ordinals; we export by name only.
+    // Values below 0x10000 are ordinals; we export by name only. A miss
+    // fails as the host's does, with the last error set.
     if (name as usize) < 0x1_0000 {
         tracing::warn!(
             module = m.name,
             ordinal = name as usize,
             "GetProcAddress by ordinal"
         );
+        host::set_last_error(ERROR_PROC_NOT_FOUND);
         return std::ptr::null_mut();
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
@@ -170,6 +172,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -349,6 +352,7 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -683,5 +687,27 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_export_of_our_modules_sets_the_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: sets and reads this thread's last error.
+        let clear = || unsafe { SetLastError(0) };
+        // SAFETY: as above.
+        let last = || unsafe { GetLastError() };
+        // The host's own modules, for comparison.
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        clear();
+        assert!(GetProcAddress(kernel32, c"NotAnExport".as_ptr().cast()).is_null());
+        assert_eq!(last(), ERROR_PROC_NOT_FOUND);
+        // Ours, by name and by ordinal.
+        let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        for name in [c"NotAnExport".as_ptr().cast(), 9999 as *const u8] {
+            clear();
+            assert!(GetProcAddress(runtime, name).is_null());
+            assert_eq!(last(), ERROR_PROC_NOT_FOUND, "{name:?}");
+        }
     }
 }
