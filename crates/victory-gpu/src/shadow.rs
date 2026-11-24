@@ -1796,16 +1796,34 @@ pub(crate) fn let_go_idle() {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // A window may be stored under multiple keys in `LOOSE`, so its
+        // map-only refcount equals the number of keys pointing to it.
+        let mut counts: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::with_capacity(map.len());
+        for s in map.values() {
+            *counts.entry(Arc::as_ptr(s) as usize).or_insert(0) += 1;
+        }
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
+                let ptr = Arc::as_ptr(s) as usize;
+                Arc::strong_count(s) == counts[&ptr]
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
+                    && !s.writes_pending()
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let mut seen = std::collections::HashSet::new();
+        let mut unique = Vec::new();
+        for key in idle {
+            if let Some(s) = map.remove(&key)
+                && seen.insert(Arc::as_ptr(&s) as usize)
+            {
+                unique.push(s);
+            }
+        }
+        unique
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -1819,6 +1837,41 @@ pub(crate) fn let_go_idle() {
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
+    }
+    // Also evict idle host copies of registered title buffers (including
+    // carded VRAM copies): title memory stays authoritative once no flight
+    // is writing to the buffer, so the next use recreates the copy cleanly.
+    let gone_buffers: Vec<Arc<Shadow>> = {
+        let mut map = buffers();
+        let mut out = Vec::new();
+        for entry in map.values_mut() {
+            let idle = entry.shadow.as_ref().is_some_and(|s| {
+                Arc::strong_count(s) == 1
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::references(&s.buffer) == 1
+                    && !s.writes_pending()
+            });
+            if idle && let Some(s) = entry.shadow.take() {
+                out.push(s);
+            }
+        }
+        out
+    };
+    if !gone_buffers.is_empty() {
+        let (went, bytes) = (
+            gone_buffers.len(),
+            gone_buffers.iter().map(|s| s.len).sum::<u64>(),
+        );
+        crate::host::trail(|| {
+            format!("sweep: {went} host copies of title buffers let go ({} KiB), held by no list and no slot", bytes >> 10)
+        });
+        for shadow in gone_buffers {
+            crate::host::retire(shadow);
+        }
+        CARDED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|w| w.strong_count() > 0);
     }
 }
 

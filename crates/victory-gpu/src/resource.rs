@@ -1430,15 +1430,27 @@ pub(crate) fn let_go_idle() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
-            continue;
+        let title_filled = fills(&r.desc) && !crate::texture::host_wrote(at);
+        if !title_filled {
+            // Render targets / depth / UAV textures hold GPU-rendered contents
+            // and are kept while their backing memory is live. Only evict a
+            // placed one once the title has unmapped its backing pages.
+            let unmapped_placed = r.host.placed.load(Relaxed)
+                && !crate::texture::committed(r.data().cast_const(), 1);
+            if !unmapped_placed {
+                continue;
+            }
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
+            let idle = made.as_ref().is_some_and(|(host, twin)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
+                    && twin.as_ref().is_none_or(|t| {
+                        std::sync::Arc::strong_count(t) == 1
+                            && crate::host::references(&t.colour.texture) == 1
+                    })
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -1449,16 +1461,21 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
+        if let Some((host, twin)) = gone {
             r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+            if title_filled {
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+            }
             went += 1;
-            bytes += host.bytes;
+            bytes += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
             if first.is_none() {
                 first = Some(at);
             }
             crate::host::retire(host);
+            if let Some(twin) = twin {
+                crate::host::retire(twin);
+            }
         }
     }
     if went > 0 {
