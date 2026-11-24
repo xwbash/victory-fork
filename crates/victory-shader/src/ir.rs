@@ -376,6 +376,7 @@ fn unspill(
                 if parks[j].is_some_and(|p| p.0 && p.1 == reg && (p.3 == lane || p.3 == lane + 1))
                     || written[j].contains(&code)
                     || written[j].contains(&(code + 1))
+                    || read[j].contains(&code)
                     || read[j].contains(&(code + 1))
                 {
                     return None;
@@ -1787,5 +1788,28 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn unspill_does_not_pair_restore_across_read_of_first_register() {
+        // v_writelane_b32 v2, s4, 0
+        // v_writelane_b32 v2, s5, 1
+        // v_readlane_b32  s4, v2, 0
+        // s_mov_b32       s6, s4     <-- legge s4 prima che s5 venga ripristinato
+        // v_readlane_b32  s5, v2, 1
+        let separated_by_read: Vec<u32> = vec![
+            0xD761_0002, 0x0001_0004, // v_writelane_b32 v2, s4, 0
+            0xD761_0002, 0x0001_0205, // v_writelane_b32 v2, s5, 1
+            0xD760_0004, 0x0001_0102, // v_readlane_b32 s4, v2, 0
+            0xBE86_0304,              // s_mov_b32 s6, s4
+            0xD760_0005, 0x0001_0302, // v_readlane_b32 s5, v2, 1
+            S_ENDPGM,
+        ];
+        let p = build_words(&separated_by_read, true);
+        let names: Vec<_> = p.blocks[0].insts.iter().map(Inst::name).collect();
+        assert!(
+            !names.contains(&"s_mov_b64"),
+            "must not coalesce restore across read of first register: {names:?}"
+        );
     }
 }
