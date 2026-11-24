@@ -7382,6 +7382,74 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // A double to a float, rounded to nearest even (the MODE
+                // default), in 32-bit integer arithmetic on its two dwords:
+                // the emitter has no 64-bit floats. Infinities stay
+                // infinities, NaNs become the quiet NaN, too-large values
+                // round to infinity.
+                // shortcut: results below f32's normal range (|x| < 2^-126)
+                // flush to signed zero instead of becoming f32 subnormals.
+                if matches!(v.src.first(), Some(Operand::Const(240..=248))) {
+                    // Inline float constants are f64 for this operand;
+                    // `src64` would read them as 32-bit integers.
+                    return Err("an inline float constant as a 64-bit operand");
+                }
+                let x = self.src64(inst, 0)?;
+                let (lo, hi) = self.split64(x);
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (k0, k1, k3, k20, k23, k29) =
+                    (k(self, 0), k(self, 1), k(self, 3), k(self, 20), k(self, 23), k(self, 29));
+                let sign_bit = k(self, 0x8000_0000);
+                let sign = self.s.m.bin(c, Bin::And, hi, sign_bit);
+                // The biased 11-bit exponent and the top 23 of the 52
+                // mantissa bits (20 in `hi`, 3 from the top of `lo`).
+                let e = self.s.m.bin(c, Bin::LShr, hi, k20);
+                let m11 = k(self, 0x7FF);
+                let exp = self.s.m.bin(c, Bin::And, e, m11);
+                let m20 = k(self, 0xF_FFFF);
+                let mhi = self.s.m.bin(c, Bin::And, hi, m20);
+                let a = self.s.m.bin(c, Bin::Shl, mhi, k3);
+                let b = self.s.m.bin(c, Bin::LShr, lo, k29);
+                let m23 = self.s.m.bin(c, Bin::Or, a, b);
+                // The 29 mantissa bits dropped decide the rounding.
+                let rmask = k(self, 0x1FFF_FFFF);
+                let rem = self.s.m.bin(c, Bin::And, lo, rmask);
+                let half = k(self, 0x1000_0000);
+                let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+                let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+                let odd = self.s.m.bin(c, Bin::And, m23, k1);
+                let odd = self.s.m.cmp(c, pred::NE, odd, k0);
+                let tie_odd = self.s.m.bin(c, Bin::And, tie, odd);
+                let up = self.s.m.bin(c, Bin::Or, above, tie_odd);
+                let i32t = self.s.t.i32;
+                let up = self.s.m.cast(c, Cast::ZExt, up, i32t);
+                // Rebias 1023 -> 127. A carry out of the mantissa moves into
+                // the exponent, which is right (and gives infinity at the top).
+                let bias = k(self, 1023 - 127);
+                let e32 = self.s.m.bin(c, Bin::Sub, exp, bias);
+                let e32 = self.s.m.bin(c, Bin::Shl, e32, k23);
+                let r = self.s.m.bin(c, Bin::Add, e32, m23);
+                let r = self.s.m.bin(c, Bin::Add, r, up);
+                // f32 exponents 1..=254 are normal: double exponents
+                // 897..=1150. Below: zero; above (and infinity): infinity.
+                let low = self.s.m.cmp(c, pred::IULE, exp, bias);
+                let top = k(self, 1023 + 128);
+                let high = self.s.m.cmp(c, pred::IUGE, exp, top);
+                let inf = k(self, 0x7F80_0000);
+                let r = self.s.m.select(c, low, k0, r);
+                let r = self.s.m.select(c, high, inf, r);
+                let all_ones = self.s.m.cmp(c, pred::EQ, exp, m11);
+                let mbits = self.s.m.bin(c, Bin::Or, mhi, lo);
+                let some = self.s.m.cmp(c, pred::NE, mbits, k0);
+                let nan = self.s.m.bin(c, Bin::And, all_ones, some);
+                let qnan = k(self, 0x7FC0_0000);
+                let r = self.s.m.select(c, nan, qnan, r);
+                let r = self.s.m.bin(c, Bin::Or, r, sign);
+                let f32t = self.s.t.f32;
+                let r = self.s.m.cast(c, Cast::Bitcast, r, f32t);
+                float(self, r)
+            }
             "v_cvt_f32_f16" if v.opsel == 0 => {
                 let a = s(self, 0)?;
                 let r = self

@@ -1264,3 +1264,56 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// `v_cvt_f32_f64 v0, v[1:2]` rounds to nearest even like the host's own
+/// conversion, keeps infinities and NaNs, overflows to infinity, and (a
+/// documented shortcut) flushes results below f32's normal range to zero.
+#[test]
+fn cvt_f32_f64_rounds_to_nearest_even() {
+    let shader = build_valu_cs(&[vop1(0x00F, 0, vgpr(1))]);
+    let tie_even = 1.0 + 2f64.powi(-24); // halfway: rounds down to 1.0
+    let tie_odd = 1.0 + 3.0 * 2f64.powi(-24); // halfway: rounds up
+    let doubles = [
+        1.0,
+        -2.5,
+        0.1,
+        std::f64::consts::PI,
+        tie_even,
+        tie_odd,
+        -0.0,
+        1e300,
+        -1e300,
+        f64::INFINITY,
+        f64::NAN,
+        3.402_823_567_797_336_6e38, // f32::MAX + half an ulp: ties to infinity
+        f32::MAX as f64,
+        f32::MIN_POSITIVE as f64,
+        1e-40, // an f32 subnormal: flushed
+        -1e-300,
+    ];
+    let cases: Vec<[u32; 4]> = doubles
+        .iter()
+        .map(|x| {
+            let b = x.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        let x = doubles[i];
+        let got = f32::from_bits(got);
+        if x.is_nan() {
+            assert!(got.is_nan(), "{backend}: NaN gave {got}");
+            return;
+        }
+        let want = if x.abs() < f32::MIN_POSITIVE as f64 {
+            if x.is_sign_negative() { -0.0 } else { 0.0 }
+        } else {
+            x as f32
+        };
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{backend}: {x:e} gave {got:e}, want {want:e}"
+        );
+    });
+}
