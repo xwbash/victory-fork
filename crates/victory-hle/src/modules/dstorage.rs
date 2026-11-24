@@ -978,8 +978,35 @@ fn into_destination(
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
+        return Ok(());
+    }
+    // A list naming page 0 (no page: numbers start at 0x10_0000) may not be
+    // filled yet: the title can write a request's pages after enqueueing
+    // it, and a queue half full is submitted on its own. Read the list
+    // again for a few milliseconds before failing, and count both cases.
+    if pages.contains(&0) {
+        static LATE: AtomicU32 = AtomicU32::new(0);
+        static STILL_ZERO: AtomicU32 = AtomicU32::new(0);
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            // SAFETY: as above; the title's list, read again.
+            let again = unsafe {
+                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
+            };
+            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
+                let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+                if late.is_power_of_two() {
+                    tracing::info!(late, still_zero = STILL_ZERO.load(Ordering::Relaxed), "dstorage: a page list filled after its request started: written late");
+                }
+                return Ok(());
+            }
+        }
+        let still = STILL_ZERO.fetch_add(1, Ordering::Relaxed) + 1;
+        if still.is_power_of_two() {
+            tracing::info!(still_zero = still, late = LATE.load(Ordering::Relaxed), "dstorage: a page list still names page 0 after 8 ms");
+        }
+    }
+    {
         // Said aloud: the title never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
@@ -1496,6 +1523,49 @@ mod tests {
         assert_eq!(wait(array, 0), S_OK);
         // SAFETY: both pages are mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
+        assert_eq!(seen, plain);
+    }
+    #[test]
+    fn a_page_list_filled_after_its_request_starts() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()), 1);
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        // The title's list, still empty when the request is submitted.
+        let list = Box::leak(Box::new([0usize; 1]));
+        let at = std::ptr::from_mut(list) as usize;
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        let number = page[0];
+        let filler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            // SAFETY: the leaked list, alive for the whole test.
+            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+        });
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        filler.join().unwrap();
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
     }
     #[test]
