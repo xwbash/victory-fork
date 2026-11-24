@@ -169,6 +169,7 @@ while pressed; releasing them restores the controller's stick values:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+| Right Alt (held) | taps A every 120 ms, to skip videos, the start screen and skip prompts (also on a connected pad; `VICTORY_SKIP_BUTTON=B`, `X`, `Y`, `MENU` or `VIEW` taps another button) |
 
 ### Xbox controllers over Bluetooth on Linux
 
