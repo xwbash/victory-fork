@@ -295,6 +295,13 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     let ids2 = [8, bvh::NONE, 24, 0x1fff_fffc];
     box_nodes.push((s.add(nodes::box32(ids2, around), 32), 5));
     box_nodes.push((s.add(nodes::box16(ids2, around), 16), 4));
+    // A child that is not there whose box the ray enters first: the
+    // reference's own test of it, in both widths, with its ray alone.
+    let (missing, missing_boxes) = nodes::MISSING_FIRST;
+    let missing_nodes = [
+        (s.add(nodes::box32(missing, missing_boxes), 32), 5),
+        (s.add(nodes::box16(missing, missing_boxes), 16), 4),
+    ];
     // Random boxes.
     for n in 0..6 {
         let boxes: [[f32; 6]; 4] = std::array::from_fn(|_| {
@@ -356,6 +363,10 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
         ] {
             cases.push(Some((n, kind, Ray::new(origin, direction, extent))));
         }
+    }
+    // The reference's test of a child that is not there, at its ray.
+    for &(n, kind) in &missing_nodes {
+        cases.push(Some((n, kind, nodes::missing_first())));
     }
     // Random rays at every box node, half of them aimed at a box.
     for &(n, kind) in &box_nodes {

@@ -32,9 +32,10 @@
 //! Four child pointers at bytes 0-15 (`0xffff_ffff`: none), then four
 //! boxes, each minimum x y z, maximum x y z: 16-bit floats from byte 16
 //! (12 bytes a box), or 32-bit floats from byte 16 (24 bytes a box; bytes
-//! 112-127 are not read). The result is the pointers of the children whose
-//! box the ray enters before its extent, nearest entry first when the
-//! descriptor enables box sorting (bit 63), and `0xffff_ffff` for the rest.
+//! 112-127 are not read). The result is the pointers of the children that
+//! are there and whose box the ray enters before its extent, nearest entry
+//! first when the descriptor enables box sorting (bit 63), and
+//! `0xffff_ffff` for the rest.
 //!
 //! # Triangle nodes
 //!
@@ -64,9 +65,10 @@
 //! JCGT 2013), and agree with what the title's own structure
 //! builder writes and its trace programs read. Not known from either: how
 //! the console rounds, which of two boxes entered at the same distance it
-//! returns first, and what it returns for a ray exactly through an edge
-//! (here: a hit in both triangles of the edge) or for kinds 6 and 7 (here:
-//! a triangle miss; the title's programs do not read it).
+//! returns first, what it returns for a ray exactly through an edge (here:
+//! a hit in both triangles of the edge), for a child that is not there
+//! whose box the ray enters (here: a miss) or for kinds 6 and 7 (here: a
+//! triangle miss; the title's programs do not read it).
 
 /// The result dword for a box the ray misses, or a child that is not there.
 pub const NONE: u32 = 0xffff_ffff;
@@ -196,8 +198,10 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A box whose minimum x is NaN is switched off.
-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        // A child that is not there is a miss, whatever bytes its box
+        // holds; a box whose minimum x is NaN is switched off.
+        let there = children[n] != NONE && !b[0].is_nan();
+        if there && leave >= enter.max(0.0) && enter < ray.extent {
             ids[n] = children[n];
             distances[n] = enter;
         }
@@ -473,8 +477,43 @@ pub(crate) mod tests {
             [UNIT, UNIT, [f32::NAN, -1.0, -1.0, 1.0, 1.0, 1.0], OFF],
         );
         let ray = Ray::new([-5.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
-        // Child 1 is hit but is not there: its pointer is what "none" is.
+        // Child 1's box is entered, but child 1 is not there: a miss.
         assert_eq!(intersect(&node, 5, &ray, true), [8, NONE, NONE, NONE]);
+    }
+
+    /// A node whose children that are not there have boxes the ray
+    /// enters: the first before the one child's, the other two at the
+    /// ray's origin. (The card tests run it too.)
+    pub(crate) const MISSING_FIRST: ([u32; 4], [[f32; 6]; 4]) = (
+        [NONE, 8, NONE, NONE],
+        [
+            [-1.0, -1.0, 1.0, 1.0, 1.0, 2.0],
+            [-1.0, -1.0, 3.0, 1.0, 1.0, 4.0],
+            [0.0; 6],
+            [0.0; 6],
+        ],
+    );
+
+    /// The ray of [`MISSING_FIRST`]: from the origin along +z.
+    pub(crate) fn missing_first() -> Ray {
+        Ray::new([0.0; 3], [0.0, 0.0, 1.0], 10.0)
+    }
+
+    #[test]
+    fn a_child_that_is_not_there_is_a_miss_whatever_its_box() {
+        let (children, boxes) = MISSING_FIRST;
+        let ray = missing_first();
+        for (node, kind) in [(box32(children, boxes), 5), (box16(children, boxes), 4)] {
+            // Sorted: the child that is there (entered at 3), then the
+            // three that are not, their boxes entered at 0 and 1.
+            assert_eq!(
+                intersect(&node, kind, &ray, true),
+                [8, NONE, NONE, NONE],
+                "kind {kind}"
+            );
+            // Not sorted: child order.
+            assert_eq!(intersect(&node, kind, &ray, false), children, "kind {kind}");
+        }
     }
 
     #[test]

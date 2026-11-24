@@ -403,6 +403,10 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
+            // A child that is not there is a miss, whatever bytes its box
+            // holds: it must not sort before a child that is.
+            let there = self.s.m.cmp(c, pred::IULT, children[n], none);
+            let hit = self.s.m.bin(c, Bin::And, hit, there);
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }
