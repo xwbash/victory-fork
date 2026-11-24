@@ -1410,12 +1410,13 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
-pub(super) fn host_max_wave() -> u32 {
+/// Whether lowering uses the forms for an adapter limited to 32 lanes.
+pub fn host_uses_wave32() -> bool {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
-        return lanes;
+        return lanes == 32;
     }
-    HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+    HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed) == 32
 }
 
 #[cfg(test)]
@@ -1691,7 +1692,7 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            if wave == 64 && host_uses_wave32() && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
