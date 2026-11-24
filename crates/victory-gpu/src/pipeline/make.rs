@@ -94,14 +94,17 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads: 5 ms, a fraction of
+/// a 30 fps frame, so a pipeline still being made does not hold the frame
+/// (a draw is dropped until it is ready; `VICTORY_PIPELINE_WAIT_MS` sets
+/// another budget).
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
+            .unwrap_or(5);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })

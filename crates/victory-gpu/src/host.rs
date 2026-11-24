@@ -1,8 +1,8 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap
-//! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
+//! Submissions are sent ahead of the wait for the card by default, so CPU
+//! and GPU overlap ([`late`], `VICTORY_LATE_WAIT=0` waits for each);
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1875,8 +1875,9 @@ impl Drop for Deferred {
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
-/// (`VICTORY_LATE_WAIT=1`; off by default, and off in the timing run, which
-/// waits for every list on its own).
+/// (on by default at stage 3; `VICTORY_LATE_WAIT=0` waits for every
+/// submission as before, and the timing run waits for every list on its
+/// own).
 ///
 /// Every submission was prepared, sent, waited for and copied back before
 /// the next one was looked at, so the card stood idle while we prepared
@@ -1925,7 +1926,8 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
-/// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+/// `VICTORY_LATE_WAIT`: 0 (off), 1, 2 ([`late_exact`]) or 3
+/// ([`late_free_present`]); 3 by default.
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -1934,12 +1936,10 @@ fn late_stage() -> u8 {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
+            Ok("0") => 0,
             Ok("1") => 1,
             Ok("2") => 2,
-            Ok("3") => 3,
-            // The relay alone: on top of stage 3.
-            Err(_) if crate::shadow::relay() => 3,
-            _ => 0,
+            _ => 3,
         }
     })
 }
@@ -1985,9 +1985,10 @@ pub(crate) fn late_free_present() -> bool {
     late_stage() > 2
 }
 
-/// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
-/// [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage,
-/// and is off with it, in the timing run and with kept snapshots).
+/// The relay's first stage (on by default at its second stage, the one the
+/// fast path measures; `VICTORY_RELAY=0` turns it off, `VICTORY_RELAY=1`
+/// keeps the first stage's waits; it is off with [`late`] off, in the
+/// timing run and with kept snapshots).
 ///
 /// With [`late`] alone every settle does three things on the thread that
 /// holds the submission lock: it waits for everything in the air, copies
@@ -2022,7 +2023,8 @@ pub(crate) fn relay() -> bool {
     *ON.get_or_init(|| late_stage() > 0 && crate::shadow::relay())
 }
 
-/// The relay's second stage (`VICTORY_RELAY=2`): a submission that reads
+/// The relay's second stage (the default; `VICTORY_RELAY=1` keeps the
+/// first): a submission that reads
 /// title memory a flight's shaders may write (a title buffer copy, a fill
 /// of upload memory, a texture) waits only until the flights that declared
 /// that memory have landed, not for everything in the air; and at
@@ -2030,7 +2032,7 @@ pub(crate) fn relay() -> bool {
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v != "1"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -2559,7 +2561,7 @@ fn late_threads() {
         tracing::info!(
             most = late_most(),
             writes = late_writes(),
-            "submissions are sent to the card without a wait for each (VICTORY_LATE_WAIT=1)"
+            "submissions are sent to the card without a wait for each (VICTORY_LATE_WAIT, default 3; 0 waits for each)"
         );
         if relay() {
             // Without it nothing would ever land.
@@ -2568,7 +2570,7 @@ fn late_threads() {
             }
             tracing::info!(
                 exact = relay_exact(),
-                "what shaders wrote is copied back by a thread of its own, beside the submitting thread (VICTORY_RELAY=1)"
+                "what shaders wrote is copied back by a thread of its own, beside the submitting thread (VICTORY_RELAY, default 2; 0 turns it off)"
             );
         }
     });
