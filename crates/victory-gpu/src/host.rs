@@ -1627,6 +1627,11 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Numbered title-memory copies (`crate::memory`) already refreshed /
+    /// marked for shader write-back on this list since the last reset (or,
+    /// for reads, since the last step that wrote title memory).
+    memory_read_seen: usize,
+    memory_write_seen: usize,
 }
 
 impl Deferred {
@@ -1637,6 +1642,22 @@ impl Deferred {
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
+    }
+
+    /// Advances the list's title-memory copy watermarks to `total` (`writes`:
+    /// whether this dispatch may write title memory) and returns
+    /// `(read_from, write_from)`.
+    fn memory_sync_range(&mut self, total: usize, writes: bool) -> (usize, usize) {
+        let read_from = self.memory_read_seen.min(total);
+        self.memory_read_seen = total;
+        let write_from = if writes {
+            let prev = self.memory_write_seen.min(total);
+            self.memory_write_seen = total;
+            prev
+        } else {
+            total
+        };
+        (read_from, write_from)
     }
 }
 
@@ -1889,6 +1910,32 @@ mod relay_tests {
         assert!(!fetch.contains(&(b, 3)));
         assert!(fetch.contains(&(b, 9)));
         assert_eq!(fetch.len(), 2);
+    }
+
+    /// Two command lists interleaved with newly numbered title-memory copies:
+    /// a list that ran earlier still refreshes and declares write-back for
+    /// copies another list numbered meanwhile, and re-refreshes all copies
+    /// after a title-memory copy or callback on the same list.
+    #[test]
+    fn memory_sync_range_covers_copies_numbered_by_other_lists() {
+        let mut list_a = super::Deferred::default();
+        let mut list_b = super::Deferred::default();
+
+        // List A sees copies 0..10 (read + write).
+        assert_eq!(list_a.memory_sync_range(10, true), (0, 0));
+        // List B numbers 5 more copies (total 15) and only reads them.
+        assert_eq!(list_b.memory_sync_range(15, false), (0, 15));
+        // List A's next dispatch must still refresh & write-back copies 10..15.
+        assert_eq!(list_a.memory_sync_range(15, true), (10, 10));
+        // List B then dispatches a writer at total 17: reads 15..17, writes 0..17.
+        assert_eq!(list_b.memory_sync_range(17, true), (15, 0));
+        // A title-memory copy clears the read watermark (refresh again) without
+        // re-declaring write-back for copies already covered.
+        list_a.memory_read_seen = 0;
+        assert_eq!(list_a.memory_sync_range(17, true), (0, 15));
+        // Resetting the list clears both watermarks.
+        list_a = super::Deferred::default();
+        assert_eq!(list_a.memory_sync_range(17, true), (0, 0));
     }
 }
 
@@ -4978,6 +5025,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.memory_read_seen = 0;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -5157,11 +5205,22 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Advances the list's title-memory copy watermarks to `total` (`writes`:
+    /// whether this dispatch may write title memory by address) and returns
+    /// `(read_from, write_from)`: the first copy index still needing a
+    /// refresh and, when `writes`, the first still needing a write-back
+    /// declaration.
+    pub(crate) fn memory_sync_range(&self, total: usize, writes: bool) -> (usize, usize) {
+        self.deferred().memory_sync_range(total, writes)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.memory_read_seen = 0;
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

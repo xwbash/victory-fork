@@ -257,7 +257,6 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
     }
@@ -290,24 +289,22 @@ pub(crate) fn ready(
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
-    const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
-    let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
+    // Bring up to date (and, with `writes`, declare for write-back) every
+    // numbered copy this list has not covered yet, including copies numbered
+    // by another command list since this list's previous dispatch.
+    const KEEP: usize = usize::MAX - 0x6d;
+    let (read_from, write_from) = list.memory_sync_range(m.copies.len(), writes);
+    for shadow in &m.copies[read_from..] {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
-        }
-        if writes && (first_write || n >= numbered) {
+        shadow.refresh(list, start, len);
+    }
+    if writes {
+        for shadow in &m.copies[write_from..] {
+            let (start, len) = shadow.span();
             shadow.gpu_writes(list, start, len);
         }
     }
-    if first_read {
+    if list.first_use(KEEP) {
         list.keep(&m.directory.0);
         list.keep(&m.faults.0);
     }
