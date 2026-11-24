@@ -2303,6 +2303,9 @@ impl State {
         arguments: &std::ops::Range<u64>,
         count: Option<u64>,
     ) -> bool {
+        if crate::indirect::executes_nothing(max) {
+            return true;
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {

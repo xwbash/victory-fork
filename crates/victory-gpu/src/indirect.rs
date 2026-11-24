@@ -391,6 +391,17 @@ fn record_clamp_as(
     true
 }
 
+/// Whether an execution of at most `max` records runs nothing, whatever its
+/// arguments and count say: `State::execute_indirect` ends it before the
+/// argument refresh, the clamp (a wait for every earlier shader write and
+/// two state changes) and the host's execution of no records. Only `max`
+/// says so on the CPU: a count buffer is mostly written by the title's
+/// passes on the card, which run after the call is recorded, so what its
+/// memory holds at recording is not what the call reads.
+pub(crate) fn executes_nothing(max: u32) -> bool {
+    max == 0
+}
+
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
@@ -727,6 +738,14 @@ void main() {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    #[test]
+    fn only_an_execution_of_no_records_ends_early() {
+        assert!(executes_nothing(0));
+        assert!(!executes_nothing(1));
+        assert!(!executes_nothing(64));
+        assert!(!executes_nothing(u32::MAX));
     }
 
     #[test]
