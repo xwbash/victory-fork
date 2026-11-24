@@ -281,7 +281,11 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, stand_in = to, "the host does not render to this format: a stand-in is used");
+                    tracing::info!(
+                        format = f,
+                        stand_in = to,
+                        "the host does not render to this format: a stand-in is used"
+                    );
                 }
                 refused
             })
