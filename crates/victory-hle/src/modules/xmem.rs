@@ -651,6 +651,38 @@ pub extern "system" fn XMemMapPhysicalPages(
     address
 }
 
+/// Count consecutive zero-page entries, without looking ahead across input
+/// arrays that an earlier unmap could invalidate or alter.
+fn scatter_unmap_run(
+    start: usize,
+    remaining: usize,
+    input_ranges: &[(usize, usize)],
+    mut entry: impl FnMut(usize) -> (usize, bool),
+) -> usize {
+    let safe = |at: usize| {
+        at != 0
+            && at.is_multiple_of(PAGE)
+            && at.checked_add(PAGE).is_some_and(|end| {
+                input_ranges.iter().all(|&(lo, hi)| end <= lo || at >= hi)
+            })
+    };
+    if !safe(start) {
+        return 1;
+    }
+    let mut count = 1usize;
+    while count < remaining {
+        let Some(expected) = count.checked_mul(PAGE).and_then(|n| start.checked_add(n)) else {
+            break;
+        };
+        let (at, unmap) = entry(count);
+        if at != expected || !unmap || !safe(at) {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (the title passes 0 for addresses to clear).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
@@ -661,7 +693,19 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
+    let inputs = n.checked_mul(size_of::<usize>()).and_then(|bytes| {
+        let first = addresses as usize;
+        let addresses = (first, first.checked_add(bytes)?);
+        let pages = if pages.is_null() {
+            (0, 0)
+        } else {
+            let second = pages as usize;
+            (second, second.checked_add(bytes)?)
+        };
+        Some([addresses, pages])
+    });
+    let mut i = 0;
+    while i < n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
             (
@@ -673,9 +717,24 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 },
             )
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        let count = if page.is_null() {
+            inputs.as_ref().map_or(1, |ranges| {
+                scatter_unmap_run(address as usize, n - i, ranges, |offset| {
+                    // SAFETY: the title passes n entries in both arrays.
+                    unsafe {
+                        let next = *addresses.add(i + offset) as usize;
+                        let unmap = pages.is_null() || *pages.add(i + offset) == 0;
+                        (next, unmap)
+                    }
+                })
+            })
+        } else {
+            1
+        };
+        if XMemMapPhysicalPages(address, count, page).is_null() {
             return 0;
         }
+        i += count;
     }
     1
 }
@@ -1078,6 +1137,79 @@ mod tests {
         let mut after = WorkingSet::default();
         XMemGetWorkingSetStatistics(0x2000_0001, &mut after);
         assert_eq!(before.title_limit - after.title_limit, 128 * MIB);
+    }
+
+    #[test]
+    fn scatter_unmap_groups_only_safe_increasing_zero_pages() {
+        let base = 16 * PAGE;
+        let entries = [
+            (base, true),
+            (base + PAGE, true),
+            (base + 2 * PAGE, false),
+            (base + 3 * PAGE, true),
+            (base + 3 * PAGE, true),
+            (0, true),
+        ];
+        let run = |offset: usize, ranges: &[(usize, usize)]| {
+            scatter_unmap_run(entries[offset].0, entries.len() - offset, ranges, |i| {
+                entries[offset + i]
+            })
+        };
+        assert_eq!(run(0, &[]), 2);
+        assert_eq!(run(3, &[]), 1);
+        assert_eq!(run(5, &[]), 1);
+        assert_eq!(run(0, &[(base, base + PAGE)]), 1);
+        assert_eq!(run(0, &[(base + PAGE, base + 2 * PAGE)]), 1);
+        assert_eq!(scatter_unmap_run(base + PAGE, 2, &[], |_| (base, true)), 1);
+        assert_eq!(scatter_unmap_run(base, 2, &[], |_| (base + 2 * PAGE, true)), 1);
+        assert_eq!(scatter_unmap_run(base + 1, 2, &[], |_| unreachable!()), 1);
+        let end = usize::MAX - PAGE + 1;
+        assert_eq!(scatter_unmap_run(end, 2, &[], |_| (0, true)), 1);
+    }
+
+    #[test]
+    fn scatter_unmaps_adjacent_pages_and_stops_at_null_address() {
+        let mut pages = [0usize; 5];
+        let mut n = pages.len();
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            5 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        assert_eq!(XMemMapPhysicalPages(base, 5, pages.as_ptr()), base);
+        let at = |i: usize| base.wrapping_byte_add(i * PAGE);
+        // SAFETY: all five pages were mapped read-write above.
+        unsafe {
+            at(0).cast::<u8>().write(17);
+            at(4).cast::<u8>().write(29);
+        }
+        let addresses = [at(1), at(2), std::ptr::null_mut(), at(3)];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 4, std::ptr::null()), 0);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(2)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(3)).host.State, MEM_COMMIT);
+        // SAFETY: the two outer pages are outside the unmapped range.
+        assert_eq!(unsafe { at(0).cast::<u8>().read() }, 17);
+        assert_eq!(unsafe { at(4).cast::<u8>().read() }, 29);
+
+        assert_eq!(XMemMapPhysicalPages(at(1), 1, &pages[1]), at(1));
+        assert_eq!(XMemMapPhysicalPages(at(2), 1, &pages[2]), at(2));
+        let addresses = [at(1), at(2), at(3), std::ptr::null_mut(), at(4)];
+        let scattered = [0, 0, pages[0], 0, 0];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), addresses.len(), scattered.as_ptr()), 0);
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(2)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(3)).host.State, MEM_COMMIT);
+        // SAFETY: the scatter mapped page 0 at slot 3 and left slot 4 alone.
+        assert_eq!(unsafe { at(3).cast::<u8>().read() }, 17);
+        assert_eq!(unsafe { at(4).cast::<u8>().read() }, 29);
+
+        assert_eq!(XMemMapPhysicalPages(base, 5, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
     #[test]
