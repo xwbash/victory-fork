@@ -13,6 +13,65 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+pub(crate) struct BufferRanges<T> {
+    passes: u64,
+    pub(crate) by_slot: std::collections::HashMap<u32, (T, u64, u64)>,
+}
+
+/// The directly indexed buffer views of one heap, with the host copies
+/// they retain between passes. Dropping the heap releases those copies.
+pub(crate) struct BufferViews<T> {
+    slots: Mutex<std::collections::BTreeSet<u32>>,
+    changed: Mutex<std::collections::HashSet<u32>>,
+    ranges: Mutex<BufferRanges<T>>,
+}
+
+impl<T> BufferViews<T> {
+    fn new() -> Self {
+        Self {
+            slots: Mutex::default(),
+            changed: Mutex::default(),
+            ranges: Mutex::new(BufferRanges {
+                passes: 0,
+                by_slot: Default::default(),
+            }),
+        }
+    }
+
+    fn written(&self, index: u32, buffer: bool) {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if buffer {
+            slots.insert(index);
+        } else if !slots.remove(&index) {
+            return;
+        }
+        self.changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(index);
+    }
+
+    pub(crate) fn begin_pass(&self) -> (Vec<u32>, std::sync::MutexGuard<'_, BufferRanges<T>>) {
+        let mut kept = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = std::mem::take(&mut *self.changed.lock().unwrap_or_else(|e| e.into_inner()));
+        // A view may go stale without a write. Revisit all slots in a
+        // fresh heap and every 16 passes thereafter.
+        let slots = if kept.passes.is_multiple_of(16) {
+            kept.by_slot.clear();
+            self.slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .collect()
+        } else {
+            changed.into_iter().collect()
+        };
+        kept.passes = kept.passes.wrapping_add(1);
+        (slots, kept)
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -54,14 +113,7 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
-    /// Title slots holding buffer views. Such a view gets its host slot
-    /// (and its memory a host copy) only when something reads it: a draw
-    /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
-    /// buffers from the whole heap.
-    buffers: Mutex<std::collections::BTreeSet<u32>>,
-    /// Of those and of the slots that left the set: the ones written since
-    /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    pub(crate) buffers: BufferViews<std::sync::Arc<crate::shadow::Shadow>>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -643,8 +695,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
-            buffers: Mutex::default(),
-            changed: Mutex::default(),
+            buffers: BufferViews::new(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -969,19 +1020,6 @@ impl HostHeap {
         }
     }
 
-    /// The title slots that hold buffer views.
-    pub(crate) fn buffer_slots(&self) -> Vec<u32> {
-        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
-    }
-
-    /// The title slots whose buffer view was written, or went, since the
-    /// last call.
-    pub(crate) fn buffer_changes(&self) -> Vec<u32> {
-        let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *changed).into_iter().collect()
-    }
-
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.
@@ -1065,19 +1103,7 @@ impl HostHeap {
                 at.add(1).write_volatile((address >> 32) as u32);
             }
         }
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let was = if stride.is_some() {
-            buffers.insert(index);
-            true
-        } else {
-            buffers.remove(&index)
-        };
-        if was {
-            self.changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(index);
-        }
+        self.buffers.written(index, stride.is_some());
         stale
     }
 
@@ -2252,6 +2278,40 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directly_indexed_buffer_ranges_follow_the_heap_lifetime() {
+        use std::sync::Arc;
+
+        let mut views = Box::new(BufferViews::new());
+        views.written(3, true);
+        views.written(7, true);
+        let (slots, mut pass) = views.begin_pass();
+        assert_eq!(slots, [3, 7]);
+        let shadow = Arc::new(());
+        let weak = Arc::downgrade(&shadow);
+        pass.by_slot.insert(7, (shadow, 16, 48));
+        drop(pass);
+        for _ in 1..16 {
+            views.written(3, true);
+            assert_eq!(views.begin_pass().0, [3]);
+            assert!(weak.upgrade().is_some());
+        }
+        let (slots, mut pass) = views.begin_pass();
+        assert_eq!(slots, [3, 7]);
+        assert!(weak.upgrade().is_none());
+
+        let shadow = Arc::new(());
+        let weak = Arc::downgrade(&shadow);
+        pass.by_slot.insert(7, (shadow, 32, 48));
+        drop(pass);
+        // The new heap's tracking state occupies exactly the old address.
+        *views = BufferViews::new();
+        assert!(weak.upgrade().is_none());
+        let (_, pass) = views.begin_pass();
+        assert!(pass.by_slot.is_empty());
+        assert_eq!(pass.passes, 1);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
