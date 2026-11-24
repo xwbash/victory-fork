@@ -140,6 +140,13 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    // A pipeline `VICTORY_SKIP_PIPELINES` names is not started early
+    // either: the early list keeps what an earlier run drew with, skipped
+    // or not, and the host compile the skip avoids would run here.
+    #[cfg(feature = "diagnostics")]
+    if super::skipped_shader(&p.shaders).is_some() {
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
