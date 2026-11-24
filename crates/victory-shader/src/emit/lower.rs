@@ -1070,6 +1070,103 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
+/// Whether every LDS access's address derives only from per-lane values
+/// (the entry VGPRs, which hold the thread's id) and uniforms and
+/// constants, never from memory or another lane's LDS word. Such accesses
+/// need no ordering between the host waves: each console lane touches only
+/// the words its own address names, and the thread relabelling gives each
+/// host wave its own console lanes' words. `VICTORY_WAVE_LDS_ASSUME=1`
+/// assumes this for every program (to try one whose addresses the analysis
+/// cannot follow; quarantine keeps a wrong guess off the title's memory).
+fn lds_lane_private(p: &crate::ir::Program) -> bool {
+    if std::env::var_os("VICTORY_WAVE_LDS_ASSUME").is_some_and(|v| v == "1") {
+        return true;
+    }
+    use crate::ir::{Reg, Value};
+    // the one instruction that writes each value (SSA: at most one)
+    let mut def: std::collections::HashMap<Value, &crate::ir::Inst> =
+        std::collections::HashMap::new();
+    for block in &p.blocks {
+        for inst in &block.insts {
+            for &(_, v) in &inst.writes {
+                def.insert(v, inst);
+            }
+        }
+    }
+    let inputs: std::collections::HashMap<Value, Reg> =
+        p.inputs.iter().cloned().map(|(r, v)| (v, r)).collect();
+    // the taint of a value: 1 per-lane, 2 uniform, 4 unknown
+    fn taint(
+        v: Value,
+        def: &std::collections::HashMap<Value, &crate::ir::Inst>,
+        inputs: &std::collections::HashMap<Value, Reg>,
+        seen: &mut std::collections::HashSet<Value>,
+    ) -> u8 {
+        if !seen.insert(v) {
+            return 4;
+        }
+        if let Some(&reg) = inputs.get(&v) {
+            return match reg {
+                Reg::V(_) => 1,
+                _ => 2,
+            };
+        }
+        let Some(inst) = def.get(&v) else { return 4 };
+        let name = inst.name();
+        // a read of memory or of shared LDS: not provably per-lane
+        if matches!(inst.fields, Fields::Buffer { .. } | Fields::Smem { .. })
+            || (matches!(inst.fields, Fields::Ds { .. })
+                && !name.starts_with("ds_swizzle")
+                && !name.contains("permute"))
+        {
+            return 4;
+        }
+        let mut t = 2u8;
+        for &(reg, sv) in &inst.reads {
+            if matches!(
+                reg,
+                Reg::Scc | Reg::S(106..=107) | Reg::S(crate::ir::EXEC..=127)
+            ) {
+                continue; // vcc/exec are wave-wide bookkeeping, not address data
+            }
+            t |= taint(sv, def, inputs, seen);
+        }
+        t
+    }
+    for block in &p.blocks {
+        for inst in &block.insts {
+            let name = inst.name();
+            if !matches!(inst.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle")
+                || name.contains("permute")
+            {
+                continue;
+            }
+            let Fields::Ds { addr, .. } = &inst.fields else { continue };
+            let Some(Operand::Vector { reg, dwords }) = addr else { return false };
+            // the values the address register holds at this instruction
+            let values: Vec<Value> = inst
+                .reads
+                .iter()
+                .filter(|&(r, _)| *r == Reg::V(*reg))
+                .map(|&(_, v)| v)
+                .take(*dwords as usize)
+                .collect();
+            if values.is_empty() {
+                return false;
+            }
+            for v in values {
+                let mut seen = std::collections::HashSet::new();
+                // per-lane: the address moves with the thread; uniform alone
+                // would name one shared word; unknown is not provable
+                if taint(v, &def, &inputs, &mut seen) & 1 == 0 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
@@ -1117,6 +1214,22 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     if (0..n).any(|r| reads[r] && writes[r]) {
+        if std::env::var_os("VICTORY_WAVE_DUMP").is_some() {
+            for r in 0..n {
+                if reads[r] && writes[r] {
+                    let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region.clone(), b) == r).collect();
+                    eprintln!("WAVE64-LDS region={r} blocks={blocks:?}");
+                    for &b in &blocks {
+                        for i in &p.blocks[b].insts {
+                            let name = i.name();
+                            if matches!(i.fields, Fields::Ds { .. }) && !name.starts_with("ds_swizzle") && !name.contains("permute") {
+                                eprintln!("  block {b}: {name}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -1540,7 +1653,13 @@ impl<'a> Lower<'a> {
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
-                if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                // LDS whose every access names only its own lane's words needs no
+                // ordering between the host waves: see `lds_lane_private`
+                let lds_private = s.lds_dwords > 0 && group > 32 && lds_lane_private(p);
+                if lds_private {
+                    eprintln!("WAVE64-LDS-PRIVATE group={group} lds={}", s.lds_dwords);
+                }
+                if !crosses && (s.lds_dwords == 0 || group <= 32 || lds_private) {
                     wave = 32;
                 } else {
                     // (Groups of several console waves too: each console wave is two host
@@ -1559,7 +1678,7 @@ impl<'a> Lower<'a> {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
                             })
                         });
-                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
+                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok || lds_private;
                         if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
@@ -1575,7 +1694,7 @@ impl<'a> Lower<'a> {
                         }
                         if lds_ok {
                             wave = 32;
-                            split_lds = s.lds_dwords > 0 && group > 32;
+                            split_lds = s.lds_dwords > 0 && group > 32 && !lds_private;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
