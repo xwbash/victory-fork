@@ -308,6 +308,79 @@ fn packed_add_selects_halves_of_inline_constants() {
     }
 }
 
+/// The scalar bit searches and counts, ported from TuxBox (brcly, Apache-2.0,
+/// `shader: restore s_flbit_i32_b64 and s_ff0_i32 lowering dropped by a merge`,
+/// 1a50eb9): SFU-free, none of them writes SCC, and the 64-bit forms look at
+/// the high word first.
+#[test]
+fn scalar_bit_searches_match_the_console() {
+    // SOP1 `s_<op> s16, s0` (`src0` 0 is s[0:1] for a two-dword source).
+    let sop1 = |op: u32, src0: u32| 0xBE80_0000 | 16 << 16 | op << 8 | src0;
+    let read_back = |op: u32, src0: u32| [sop1(op, src0), vop1(0x001, 0, sgpr(16))];
+
+    // s_flbit_i32_b64: 31 less the high word's first set bit from the top, else
+    // 32 past the low word's, ~0 for a zero pair.
+    let flbit = |[lo, hi, _, _]: [u32; 4]| {
+        if hi != 0 {
+            hi.leading_zeros()
+        } else if lo != 0 {
+            32 + lo.leading_zeros()
+        } else {
+            u32::MAX
+        }
+    };
+    let cases = [
+        [0, 1, 0, 0],
+        [0, 0x8000_0000, 0, 0],
+        [0x1234_5678, 0, 0, 0],
+        [1, 0, 0, 0],
+        [0x8000_0000, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0],
+    ];
+    let shader = build_valu_cs(&read_back(0x16, 0));
+    run_cases(&shader, &cases, |backend, _i, inp, got| {
+        assert_eq!(got, flbit(inp), "{backend}: s_flbit_i32_b64{s:?}", s = inp);
+    });
+
+    // s_ff0_i32_b32: the first zero bit from the bottom, ~0 when there is none.
+    let ff0_b32 = |[a, _, _, _]: [u32; 4]| {
+        if a == u32::MAX {
+            u32::MAX
+        } else {
+            (!a).trailing_zeros()
+        }
+    };
+    let cases = [[0, 0, 0, 0], [1, 0, 0, 0], [0x8000_0001, 0, 0, 0], [0xFFFF_FFFF, 0, 0, 0], [0xFFFF_FFFE, 0, 0, 0]];
+    let shader = build_valu_cs(&read_back(0x11, 0));
+    run_cases(&shader, &cases, |backend, _i, inp, got| {
+        assert_eq!(got, ff0_b32(inp), "{backend}: s_ff0_i32_b32{s:?}", s = inp);
+    });
+
+    // s_ff0_i32_b64: the same over the pair, low word first.
+    let ff0_b64 = |[lo, hi, _, _]: [u32; 4]| {
+        if !lo != 0 {
+            (!lo).trailing_zeros()
+        } else if !hi != 0 {
+            32 + (!hi).trailing_zeros()
+        } else {
+            u32::MAX
+        }
+    };
+    let cases = [
+        [0, 0, 0, 0],
+        [0xF000_0000, 0, 0, 0],
+        [0xFFFF_FFFF, 0, 0, 0],
+        [0xFFFF_FFFF, 0x7FFF_FFFF, 0, 0],
+        [0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0],
+    ];
+    let shader = build_valu_cs(&read_back(0x12, 0));
+    run_cases(&shader, &cases, |backend, _i, inp, got| {
+        assert_eq!(got, ff0_b64(inp), "{backend}: s_ff0_i32_b64{s:?}", s = inp);
+    });
+
+}
+
 #[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
