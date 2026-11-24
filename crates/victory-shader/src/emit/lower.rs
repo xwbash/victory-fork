@@ -11176,6 +11176,78 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A loop's back edge decided by `s_cbranch_vccz`/`vccnz` on a compare
+    /// that differs between lanes: the console leaves the loop with the
+    /// whole wave as soon as one lane meets the exit (VCC is tested
+    /// wave-wide), so a lane whose own test never holds leaves with the
+    /// others. The lane's own bit (the structurisation's rule for mask
+    /// tests) keeps such a lane looping, up to the iteration limit in every
+    /// pass: a clustered-light loop that runs while the first lane's word
+    /// index differs from each lane's end runs about 2^20 times in a lane of
+    /// another cluster, which made world draws take seconds on an RTX 5070.
+    /// Here the host wave leaves when one of its lanes does (`waveAnyTrue`
+    /// of the exit). A lane also still leaves on its own exit, so a wave of
+    /// helper lanes only, which wave votes leave out, keeps the lane rule.
+    /// Other branches keep the lane rule: they skip work, or test a value
+    /// the same in every lane.
+    fn wave_loop_exit(&mut self, b: usize, when: Bool, cond: V, taken: usize, not_taken: usize) -> V {
+        // A branch the wave already takes together ([`Structured::wide`]) has its
+        // console-wide answer in `cond`.
+        if self.x.st.wide.contains(&b) {
+            return cond;
+        }
+        let vcc_test = self.x.p.blocks[b]
+            .insts
+            .last()
+            .is_some_and(|i| matches!(i.name(), "s_cbranch_vccz" | "s_cbranch_vccnz"));
+        // Whether a lane going to `to` stays in a loop around `b`: `to` is
+        // its header, or a few plain jumps lead there (the back edge often
+        // sits in a block of its own).
+        let back = |l: &Self, to: usize| {
+            let mut x = to;
+            for _ in 0..8 {
+                if l.counters.contains_key(&x) && l.rpo[x] <= l.rpo[b] {
+                    return true;
+                }
+                match l.x.st.exits[x] {
+                    LaneExit::Jump(n) => x = n,
+                    _ => return false,
+                }
+            }
+            false
+        };
+        let (back_taken, back_not_taken) = (back(self, taken), back(self, not_taken));
+        // One way stays in the loop, the other leaves it.
+        if back_taken == back_not_taken {
+            return cond;
+        }
+        let per_lane = self
+            .x
+            .st
+            .bools
+            .support(when)
+            .iter()
+            .any(|a| !matches!(a, crate::structure::Atom::Uniform(_)));
+        if !vcc_test || !per_lane {
+            return cond;
+        }
+        let c = self.cur;
+        let i1 = self.s.t.i1;
+        let (t, f) = (self.s.m.bool(true), self.s.m.bool(false));
+        self.s.flags |= flags::WAVE_OPS;
+        if back_taken {
+            // `cond` continues the loop: leave when some lane leaves.
+            let leave = self.s.m.select(c, cond, f, t);
+            let any = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[leave]);
+            self.s.m.select(c, any, f, cond)
+        } else {
+            // `cond` leaves the loop.
+            let any = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[cond]);
+            self.s.m.bin(c, Bin::Or, cond, any)
+        }
+    }
+
+
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
         let offset = self.x.p.blocks[b]
             .insts
@@ -11215,6 +11287,7 @@ impl<'a> Lower<'a> {
                         (c, taken, not_taken)
                     }
                 };
+                let cond = self.wave_loop_exit(b, when, cond, taken, not_taken);
                 // A back edge is taken only below the iteration limit.
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
