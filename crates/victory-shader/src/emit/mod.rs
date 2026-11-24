@@ -1037,6 +1037,47 @@ mod tests {
         assert!(e.contains("a carry-in from an untracked mask"), "{e}");
     }
 
+    /// A wave64 compute program reading SCC of a mask operation (`scc_some`)
+    /// inside a divergent per-lane branch on a 32-lane host: exchanging the
+    /// two halves' answers needs every lane there, so `emit` falls back to
+    /// `with_local_waves_any` and takes each host wave's `WaveAnyTrue`.
+    #[test]
+    fn scc_some_in_a_divergent_branch_lowers_per_host_wave_on_wave32() {
+        // Direct read (`s_and_b64` -> `s_cselect_b32`) and scalar-skip phi join
+        // inside a per-lane divergent branch (`s_and_saveexec_b64`).
+        let direct = [
+            0x7E02_0287, // v_mov_b32 v1, 7
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+            0xBF88_0004, // s_cbranch_execz 4
+            0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+            0x8784_6A7E, // s_and_b64 s[4:5], exec, vcc (sets SCC in scc_some)
+            0x8506_8789, // s_cselect_b32 s6, 9, 7
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        ];
+        let joined = [
+            0x7E02_0287, // v_mov_b32 v1, 7
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+            0xBF88_0006, // s_cbranch_execz 6
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF84_0002, // s_cbranch_scc0 2 (uniform skip, SCC = 0)
+            0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+            0x8784_6A7E, // s_and_b64 s[4:5], exec, vcc (sets SCC in scc_some)
+            0x8506_8789, // s_cselect_b32 s6, 9, 7 (reads joined SCC phi)
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        ];
+        for body in [&direct[..], &joined[..]] {
+            stores_v1(body).unwrap();
+            lower::TEST_HOST_WAVE.set(Some(32));
+            let res = stores_v1(body);
+            lower::TEST_HOST_WAVE.set(None);
+            res.unwrap();
+        }
+    }
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {

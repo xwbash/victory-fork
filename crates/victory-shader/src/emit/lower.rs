@@ -1394,6 +1394,11 @@ thread_local! {
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    if matches!(i.fields, Fields::Sop { .. })
+        && i.read(Reg::Scc).is_some_and(|v| st.scc_some.contains_key(&v))
+    {
+        return true;
+    }
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
@@ -1620,6 +1625,12 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
+            let scc_phi_mask = p.blocks.iter().any(|b| {
+                b.phis.iter().any(|phi| {
+                    phi.reg == Reg::Scc
+                        && phi.args.iter().any(|v| x.st.scc_some.contains_key(v))
+                })
+            });
             console_lanes = insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
@@ -1629,7 +1640,8 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || lane_constant_masks(x.st)
+            }) || scc_phi_mask
+                || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
             let mut wave = if x.native.wave64 { 64 } else { 32 };
@@ -1653,7 +1665,8 @@ impl<'a> Lower<'a> {
                         || n.starts_with("ds_permute")
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, i)
-                }) || lane_constant_masks(x.st)
+                }) || scc_phi_mask
+                    || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
                 // LDS whose every access names only its own lane's words needs no
                 // ordering between the host waves: see `lds_lane_private`
@@ -2721,6 +2734,13 @@ impl<'a> Lower<'a> {
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
+            }
+            Some(&Val::Missing(_)) | None
+                if self.mask_ok
+                    && self.mask_data == MaskData::Console
+                    && self.x.st.scc_some.contains_key(&v) =>
+            {
+                return self.scc_some(v).map(Val::Bit);
             }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
@@ -4025,8 +4045,12 @@ impl<'a> Lower<'a> {
     /// exchange theirs, which needs every lane there.
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
-        // (not for a console wave cut into host waves that do not exchange)
-        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
+        // (not for a console wave cut into host waves that do not exchange,
+        // unless `local_any` takes every mask read per host wave)
+        if !self.console_lanes
+            || self.local && !self.local_any
+            || self.exchange.is_none() && self.halves.is_some()
+        {
             return Err(LANE_MASK);
         }
         let made = self.def_block.get(&scc).copied();
@@ -4039,7 +4063,7 @@ impl<'a> Lower<'a> {
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
-        if !self.exchange.as_ref().is_some_and(|e| !e.1) {
+        if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
