@@ -522,6 +522,11 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        if victory_shader::emit::portable_heap() {
+            tracing::info!("view heap capped at {PORTABLE_VIEWS} on every GPU (VICTORY_PORTABLE_HEAP=0: off)");
+            victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+            return;
+        }
         let Some(host) = host() else { return };
         // SAFETY: plain heap creation; the heap is released at once.
         let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
@@ -574,7 +579,13 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count, size) = match make(count + extra) {
+        let forced = !sampler && count + extra > PORTABLE_VIEWS && victory_shader::emit::portable_heap();
+        let first = if forced {
+            Err(windows::core::Error::from(windows::Win32::Foundation::E_OUTOFMEMORY))
+        } else {
+            make(count + extra)
+        };
+        let (heap, count, size) = match first {
             Ok(heap) => (heap, count, count + extra),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches

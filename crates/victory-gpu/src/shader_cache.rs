@@ -75,6 +75,9 @@ fn build() -> &'static [u8; 32] {
                 }
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                if victory_shader::emit::portable_heap() {
+                    bytes.extend_from_slice(b"portable-heap");
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
