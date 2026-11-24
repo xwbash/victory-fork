@@ -380,29 +380,71 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
-        }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+    ///
+    /// Also counts all slots, as the frame line needs the whole backlog:
+    /// queued, due, waiting for memory, partly uploaded, and the age in
+    /// frames of the oldest due write.
+    fn due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+        let mut counts = [self.slots.len() as u64, 0, 0, 0, 0];
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
+        for (&index, w) in &self.slots {
+            if w.mapped > 0 {
+                counts[3] += 1;
+            } else if w.looks > 0 {
+                counts[2] += 1;
+            }
+            if w.due <= frame {
+                counts[1] += 1;
+                counts[4] = counts[4].max(frame.saturating_sub(w.written));
+                if max > 0 {
+                    let class = if w.looks > 0 || w.mapped > 0 {
+                        &mut again
+                    } else {
+                        &mut fresh
+                    };
+                    class.push((w.write, index));
+                }
             }
         }
-        order.truncate(max);
-        order
+        let retries = again.len().min(max);
+        let first_retry = again.len() - retries;
+        let by_write = |&(write, _): &(u64, u32)| write;
+        if first_retry > 0 {
+            again.select_nth_unstable_by_key(first_retry, by_write);
+        }
+        let again = &mut again[first_retry..];
+        again.sort_unstable_by_key(by_write);
+        let fresh_count = fresh.len().min(max - retries);
+        let mut order = Vec::with_capacity(retries + fresh_count);
+        order.extend(again.iter().rev().map(|&(write, index)| (index, write)));
+        if fresh_count == 0 {
+            return (order, counts);
+        }
+
+        // The write number gives the order. Only sort the ends we will
+        // serve, leaving the middle of a large backlog unordered.
+        let oldest_count = fresh_count / 2;
+        let newest_count = fresh_count - oldest_count;
+        let newest_start = fresh.len() - newest_count;
+        if fresh_count == fresh.len() {
+            fresh.sort_unstable_by_key(by_write);
+        } else {
+            fresh.select_nth_unstable_by_key(newest_start, by_write);
+            if oldest_count > 0 {
+                fresh[..newest_start].select_nth_unstable_by_key(oldest_count, by_write);
+                fresh[..oldest_count].sort_unstable_by_key(by_write);
+            }
+            fresh[newest_start..].sort_unstable_by_key(by_write);
+        }
+        let mut oldest = fresh[..oldest_count].iter();
+        for &(write, index) in fresh[newest_start..].iter().rev() {
+            order.push((index, write));
+            if let Some(&(write, index)) = oldest.next() {
+                order.push((index, write));
+            }
+        }
+        (order, counts)
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -449,25 +491,6 @@ impl TextureQueue {
     /// (0: not uploaded, or all of it was).
     fn mapped(&self, index: u32) -> u64 {
         self.slots.get(&index).map_or(0, |w| w.mapped)
-    }
-
-    /// For the frame line: slots in the queue; of them due at `frame`;
-    /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
-    fn census(&self, frame: u64) -> [u64; 5] {
-        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
-        for w in self.slots.values() {
-            if w.mapped > 0 {
-                c[3] += 1;
-            } else if w.looks > 0 {
-                c[2] += 1;
-            }
-            if w.due <= frame {
-                c[1] += 1;
-                c[4] = c[4].max(frame.saturating_sub(w.written));
-            }
-        }
-        c
     }
 }
 
@@ -848,12 +871,11 @@ impl HostHeap {
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
-    /// with its write number, in the order to serve them
-    /// ([`TextureQueue::due`]), and the queue's counts
-    /// ([`TextureQueue::census`]).
+    /// with its write number, in service order. Also returns counts for
+    /// the whole queue ([`TextureQueue::due`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        textures.due(frame, max)
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -2434,37 +2456,39 @@ mod tests {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
+        let order: Vec<u32> = q.due(9, 100).0.into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2).len(), 2);
-        assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
+        assert_eq!(q.due(9, 2).0.len(), 2);
+        assert_eq!(q.due(9, 0).1, [9, 9, 0, 0, 8]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
-        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        let write = |q: &TextureQueue, index: u32| {
+            q.due(u64::MAX, 100).0.into_iter().find(|d| d.0 == index).unwrap().1
+        };
         let w17 = write(&q, 17);
         let mut frame = 9;
         for wait in [1, 2, 4, 4] {
             q.later(17, w17, frame, 4);
-            assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
+            assert!(!q.due(frame + wait - 1, 100).0.iter().any(|d| d.0 == 17));
             frame += wait;
             // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            assert_eq!(q.due(frame, 100).0[0].0, 17);
         }
-        assert_eq!(q.census(9)[2], 1);
+        assert_eq!(q.due(9, 0).1[2], 1);
         q.done(17, w17);
-        assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
+        assert!(!q.due(u64::MAX, 100).0.iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert_eq!(q.due(12, 100).0[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100)[0].0, 16);
+        assert_eq!(q.due(13, 100).0[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
@@ -2472,11 +2496,44 @@ mod tests {
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
-        assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
+        assert!(q.due(14, 100).0.iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
         q.written(98, 14, 16, false);
-        assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
-        assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+        assert!(!q.due(15, 100).0.iter().any(|d| d.0 == 98));
+        assert!(q.due(16, 100).0.iter().any(|d| d.0 == 98));
+    }
+
+    #[test]
+    fn a_limited_texture_pass_keeps_the_full_queue_priority_and_counts() {
+        let mut q = TextureQueue::default();
+        for (frame, slot) in [3, 12, 5, 8, 11, 2, 10, 6, 7, 4, 1, 9].into_iter().enumerate() {
+            q.written(slot, frame as u64, 0, false);
+        }
+        q.later(5, 3, 11, 4);
+        q.partly(11, 5, 12, 4096);
+        q.later(6, 8, 11, 4);
+        q.partly(10, 7, 13, 4096);
+        q.written(4, 11, 14, false);
+
+        // Three retries first, newest write first. The remaining seven
+        // alternate between newest and oldest, with no slot repeated.
+        let priority = [
+            (6, 8),
+            (11, 5),
+            (5, 3),
+            (9, 12),
+            (3, 1),
+            (1, 11),
+            (12, 2),
+            (7, 9),
+            (8, 4),
+            (2, 6),
+        ];
+        for max in 0..=priority.len() + 1 {
+            let (ready, counts) = q.due(12, max);
+            assert_eq!(ready, priority[..max.min(priority.len())], "max={max}");
+            assert_eq!(counts, [12, 10, 2, 2, 12], "max={max}");
+        }
     }
 
     /// A view written over memory that older views describe otherwise
