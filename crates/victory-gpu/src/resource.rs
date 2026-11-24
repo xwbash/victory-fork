@@ -1155,8 +1155,9 @@ struct Hosted {
     /// When the host copy was last asked for (`crate::host::moment`),
     /// written under `made`'s lock.
     used: std::sync::atomic::AtomicU64,
-    /// The host refused to make it: not tried again.
-    refused: std::sync::atomic::AtomicBool,
+    /// Whether the host refused to make it, and when it is tried again
+    /// ([`refused_after`]).
+    refused: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -1170,6 +1171,49 @@ struct Hosted {
 #[cfg(windows)]
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Since the start: textures whose host copy the host refused; of them
+/// refused for good at once (not for lack of memory), made on a later try
+/// ([`refused_after`]), and given up after their last try.
+#[cfg(windows)]
+pub(crate) static REFUSALS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// In [`Hosted::refused`]: not tried again. Otherwise the word holds the
+/// failures so far (high 16 bits) and the moment from which the texture
+/// may be tried again (`crate::host::now_ms`, low 48 bits); 0 while
+/// nothing failed.
+const REFUSED_FOR_GOOD: u64 = u64::MAX;
+const RETRY_AT: u64 = (1 << 48) - 1;
+/// Tries after the first failure before a texture is given up for good.
+const RETRIES: u64 = 8;
+/// The wait before the first try again; it doubles with each failure
+/// (1 s, 2 s, ... 128 s: the last try some four minutes after the first).
+const RETRY_MS: u64 = 1_000;
+
+/// What [`Hosted::refused`] holds after the host failed to make a texture
+/// with error `code` (`None`: no error to tell) at `now`, if it held `was`.
+/// Only a lack of memory is tried again: the driver says E_OUTOFMEMORY for
+/// a card at its budget and for the system's commit limit alike, and
+/// memory frees as textures are let go ([`let_go_idle`]). Any other error
+/// is about the description (E_INVALIDARG: a format, size or flags the
+/// host has not) or the device gone (DXGI_ERROR_DEVICE_REMOVED and its
+/// kin), which no later try mends. Before, a texture refused once was
+/// refused for the run, and every view of it read zeros.
+fn refused_after(was: u64, code: Option<i32>, now: u64) -> u64 {
+    const E_OUTOFMEMORY: i32 = 0x8007_000E_u32 as i32;
+    let failures = (was >> 48) + 1;
+    if code != Some(E_OUTOFMEMORY) || failures > RETRIES {
+        return REFUSED_FOR_GOOD;
+    }
+    failures << 48 | now.saturating_add(RETRY_MS << (failures - 1)) & RETRY_AT
+}
+
+/// Whether a texture whose [`Hosted::refused`] holds `word` may be made at
+/// `now`: at most one try per wait, however many draws ask meanwhile.
+fn may_make(word: u64, now: u64) -> bool {
+    word == 0 || word != REFUSED_FOR_GOOD && now >= word & RETRY_AT
+}
 
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
@@ -1277,7 +1321,8 @@ pub(crate) fn title_fills(this: This) -> bool {
 }
 
 /// Whether `this` is a texture whose host copy is not made yet (and may
-/// still be): a descriptor slot written with a view of it waits
+/// still be, also after the host refused it for lack of memory): a
+/// descriptor slot written with a view of it waits
 /// (`crate::descriptor::make_waiting`).
 #[cfg(windows)]
 pub(crate) fn host_waits(this: This) -> bool {
@@ -1285,13 +1330,15 @@ pub(crate) fn host_waits(this: This) -> bool {
         return false;
     }
     let r = resource(this);
+    let refused = r.host.refused.load(std::sync::atomic::Ordering::Relaxed);
     r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
+        && refused != REFUSED_FOR_GOOD
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
 
 /// The host side of title texture `this`: made now if it is not there and
-/// `make` says so. `None` for buffers and for textures the host refuses.
+/// `make` says so. `None` for buffers and for textures the host refuses
+/// (for good, or until their next try: [`refused_after`]).
 #[cfg(windows)]
 fn hosted(this: This, make: bool) -> Option<Made> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1301,7 +1348,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
-        if !make || r.host.refused.load(Relaxed) {
+        let now = crate::host::now_ms();
+        let refused = r.host.refused.load(Relaxed);
+        if !make || !may_make(refused, now) {
             return None;
         }
         let clear = r
@@ -1309,10 +1358,42 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
-            r.host.refused.store(true, Relaxed);
-            return None;
+        let texture = match host_texture(&r.desc, r.host.state, clear, refused == 0) {
+            Ok(texture) => texture,
+            Err(code) => {
+                let after = refused_after(refused, code, now);
+                r.host.refused.store(after, Relaxed);
+                let again = after != REFUSED_FOR_GOOD;
+                if refused == 0 {
+                    REFUSALS[0].fetch_add(1, Relaxed);
+                    if !again {
+                        REFUSALS[1].fetch_add(1, Relaxed);
+                    }
+                } else if !again {
+                    REFUSALS[3].fetch_add(1, Relaxed);
+                    tracing::warn!(
+                        error = ?code.map(windows::core::HRESULT),
+                        resource = ?this,
+                        desc = ?r.desc,
+                        failures = (refused >> 48) + 1,
+                        "no host texture after its last try: given up"
+                    );
+                }
+                return None;
+            }
         };
+        if refused != 0 {
+            r.host.refused.store(0, Relaxed);
+            REFUSALS[2].fetch_add(1, Relaxed);
+            tracing::info!(
+                resource = ?this,
+                desc = ?r.desc,
+                failures = refused >> 48,
+                made_late = REFUSALS[2].load(Relaxed),
+                refused = REFUSALS[0].load(Relaxed),
+                "host texture made on a later try"
+            );
+        }
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -1638,19 +1719,22 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 }
 
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags. If it makes none, the error
+/// the host gave (`None`: there is no host, or it said nothing), with a
+/// warning if `loud`.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    loud: bool,
+) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<i32>> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
-        return None;
+        return Err(None);
     }
-    let host = crate::host::host()?;
+    let host = crate::host::host().ok_or(None)?;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -1748,14 +1832,20 @@ fn host_texture(
         )
     };
     if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
+        // Once per texture: a texture refused for lack of memory is tried
+        // again ([`refused_after`]), thousands of them under pressure.
+        if loud {
+            tracing::warn!(error = %e, desc = ?d, "no host texture");
+        } else {
+            tracing::debug!(error = %e, desc = ?d, "no host texture on a later try");
+        }
+        return Err(Some(e.code().0));
     }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
-        });
-    }
-    texture
+    let texture = texture.ok_or(None)?;
+    crate::host::name(&texture, || {
+        format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+    });
+    Ok(texture)
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1826,7 +1916,7 @@ fn hand_out_resource(
             // then color or depth and stencil: 5 words) or null.
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
-            refused: std::sync::atomic::AtomicBool::new(false),
+            refused: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
         },
@@ -3583,7 +3673,7 @@ float4 lit() : SV_Target { return 1.0; }
         // CreateCommittedResource succeed without id=599 / id=815, and Host::rtv
         // returns None instead of triggering 0x887A0001.
         let clear = [67u32, 0, 0, 0, 0];
-        let shared_exp = host_texture(&make(67, 5), 0, clear.as_ptr().cast())
+        let shared_exp = host_texture(&make(67, 5), 0, clear.as_ptr().cast(), false)
             .expect("R9G9B9E5_SHAREDEXP texture should succeed with unsupported flags dropped");
         // SAFETY: live D3D12 resource.
         let d = unsafe { shared_exp.GetDesc() };
@@ -3592,10 +3682,46 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(host.rtv(Some(&shared_exp), None).is_none());
 
         // R8G8B8A8_TYPELESS (27) with flags=5 must keep ALLOW_UNORDERED_ACCESS.
-        let typeless = host_texture(&make(27, 5), 0, std::ptr::null())
+        let typeless = host_texture(&make(27, 5), 0, std::ptr::null(), false)
             .expect("R8G8B8A8_TYPELESS texture should succeed");
         // SAFETY: live D3D12 resource.
         let td = unsafe { typeless.GetDesc() };
         assert_ne!(td.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, 0);
+    }
+
+    #[test]
+    fn only_a_lack_of_memory_is_tried_again_and_not_for_ever() {
+        const OUT_OF_MEMORY: Option<i32> = Some(0x8007_000E_u32 as i32);
+        const INVALID: Option<i32> = Some(0x8007_0057_u32 as i32);
+        const DEVICE_REMOVED: Option<i32> = Some(0x887A_0005_u32 as i32);
+        const DEVICE_HUNG: Option<i32> = Some(0x887A_0006_u32 as i32);
+        assert!(may_make(0, 0), "never refused");
+        for code in [INVALID, DEVICE_REMOVED, DEVICE_HUNG, None] {
+            let word = refused_after(0, code, 5);
+            assert_eq!(word, REFUSED_FOR_GOOD, "{code:?}");
+            assert!(!may_make(word, u64::MAX >> 1));
+        }
+        // Out of memory: once per wait, each wait twice the last, then given up.
+        let (mut word, mut now, mut tries) = (0, 1_000, 0);
+        let mut last_wait = 0;
+        loop {
+            word = refused_after(word, OUT_OF_MEMORY, now);
+            if word == REFUSED_FOR_GOOD {
+                break;
+            }
+            let at = word & RETRY_AT;
+            assert!(at - now > last_wait, "the wait grows");
+            last_wait = at - now;
+            assert!(!may_make(word, at - 1), "not before the wait");
+            assert!(may_make(word, at));
+            now = at;
+            tries += 1;
+        }
+        assert_eq!(tries, RETRIES, "tried again so often, then given up");
+        assert!(!may_make(word, u64::MAX >> 1));
+        // The device gone on a later try: not tried again.
+        let word = refused_after(0, OUT_OF_MEMORY, 0);
+        let gone = refused_after(word, DEVICE_REMOVED, RETRY_MS);
+        assert_eq!(gone, REFUSED_FOR_GOOD);
     }
 }

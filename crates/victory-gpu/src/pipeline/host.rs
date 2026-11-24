@@ -1240,7 +1240,7 @@ mod tests {
             // Replay onto a second host list, exercising `State::replay`.
             let list = host.new_list().unwrap();
             state.replay(&list);
-            let rtv = host.rtv(Some(&color), None);
+            let rtv = host.rtv(Some(&color), None).expect("a render target view");
             let dsv = host.dsv(&depth, None);
             let vp = D3D12_VIEWPORT {
                 TopLeftX: 0.0,

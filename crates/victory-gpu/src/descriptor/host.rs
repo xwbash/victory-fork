@@ -1383,10 +1383,42 @@ impl HostHeap {
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+                if !later {
+                    self.refused_for_now(&mut made, index, handle, &view);
+                }
             }
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Host slot `index` was just made null from `view`. If its texture is
+    /// one the host refused for lack of memory and tries again
+    /// (`crate::resource::host_waits`), the slot counts as not made, so
+    /// that a look after the texture is made makes it: the texture's own
+    /// making (`super::make_waiting`, for a view of a texture object), a
+    /// draw that reads it through a table, or the pass for textures picked
+    /// by index, which looks at it again in `RETRY_FRAMES` frames (the
+    /// pass takes the slot out of its queue on the failure). Counted as
+    /// made, it read zeros for the rest of the run.
+    fn refused_for_now(&self, made: &mut [u64], index: u32, handle: u64, view: &View) {
+        /// Frames until the pass looks at such a slot again: the try
+        /// itself waits a second or more (`crate::resource::refused_after`).
+        const RETRY_FRAMES: u64 = 16;
+        let placed = placed_texture(view);
+        let Some(texture) = placed.as_ref().unwrap_or(view).waiting_texture() else {
+            return;
+        };
+        made[index as usize] = 0;
+        // (`make_waiting` makes only slots that view the texture object.)
+        if placed.is_none() {
+            super::wait_for(texture, handle);
+        }
+        let frame = crate::frame::current();
+        if !self.tabled_lately(index, frame) {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            textures.changed(index, frame, frame + RETRY_FRAMES);
+        }
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
