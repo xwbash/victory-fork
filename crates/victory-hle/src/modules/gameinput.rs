@@ -115,6 +115,42 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// The skip key, Right Alt (`VK_RMENU`; AltGr on layouts that have one, which
+/// Windows reports as Right Alt too).
+const SKIP_KEY: u8 = 0xA5;
+/// Half the skip key's tapping period, in microseconds (the poll clock).
+const SKIP_HALF_PERIOD: u64 = 120_000;
+
+/// The button the skip key taps: A, or `VICTORY_SKIP_BUTTON` (`B`, `X`, `Y`,
+/// `MENU`, `VIEW`).
+fn skip_button() -> u32 {
+    static BUTTON: LazyLock<u32> = LazyLock::new(|| {
+        let asked = std::env::var("VICTORY_SKIP_BUTTON").unwrap_or_default();
+        match asked.trim().to_ascii_uppercase().as_str() {
+            "B" => B,
+            "X" => X,
+            "Y" => Y,
+            "MENU" => MENU,
+            "VIEW" => VIEW,
+            _ => A,
+        }
+    });
+    *BUTTON
+}
+
+/// The buttons the skip key presses at `now` (microseconds) with `keys` held:
+/// while it is down, the skip button goes down and up every 120 ms, so what
+/// waits for a new press of it (videos, the start screen, a cutscene's skip
+/// prompt) sees one at whatever rate the title reads its pads.
+fn skip_taps(keys: &[KeyState], now: u64) -> u32 {
+    let held = keys.iter().any(|k| k.virtual_key == SKIP_KEY);
+    if held && (now / SKIP_HALF_PERIOD).is_multiple_of(2) {
+        skip_button()
+    } else {
+        0
+    }
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -455,10 +491,24 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        // The skip key taps the stand-in pad, or the first host pad that is
+        // connected (the title then listens to the host's pads).
+        let taps = skip_taps(&keys, now);
+        let first = pads.iter().position(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = pad.map(|mut p| {
+                if Some(slot) == first {
+                    p.buttons |= taps;
+                }
+                p
+            });
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| {
+            let mut p = fallback(&keys);
+            p.buttons |= taps;
+            Value::Pad(p)
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1485,6 +1535,43 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn the_skip_key_taps_the_skip_button_while_held() {
+        let held = [key(b'W'), key(SKIP_KEY)];
+        assert_eq!(skip_taps(&held, 0), A);
+        assert_eq!(skip_taps(&held, SKIP_HALF_PERIOD - 1), A);
+        assert_eq!(skip_taps(&held, SKIP_HALF_PERIOD), 0);
+        assert_eq!(skip_taps(&held, 2 * SKIP_HALF_PERIOD + 5), A);
+        assert_eq!(skip_taps(&[key(0x0D)], 0), 0);
+        assert_eq!(skip_taps(&[], 0), 0);
+    }
+
+    /// The skip key reaches the first host pad that is connected, not an
+    /// empty slot 0.
+    #[test]
+    fn the_skip_key_reaches_the_first_connected_pad() {
+        let (hub, host) = fake();
+        {
+            let mut h = host.lock().unwrap();
+            h.pads[1] = Some(PadState::default());
+            h.keys = vec![key(SKIP_KEY)];
+        }
+        // Poll until a reading falls in a tapping half (one poll may land in either).
+        let mut seen = false;
+        for _ in 0..40 {
+            hub.poll();
+            if let Ok(r) = current(hub, GAMEPAD_KIND, 1) {
+                seen |= pad(r).buttons & A != 0;
+                release(r);
+            }
+            if seen {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(seen);
     }
 
     #[test]

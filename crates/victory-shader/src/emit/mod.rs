@@ -967,6 +967,21 @@ mod tests {
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
     }
 
+    /// `v_permlane16_b32` / `v_permlanex16_b32` outside a whole-wave section:
+    /// each lane reads a lane of its own row or of the other row of its pair.
+    /// They stopped the translation ("v_permlanex16_b32").
+    #[test]
+    fn row_permutes_read_the_lane_their_selects_name() {
+        // v_permlanex16_b32 v1, v0, 0, 0 and v_permlane16_b32 v1, v0, 0, 0,
+        // then the same with literal selects and FI | BOUND_CTRL (op_sel 3)
+        for op in [0x378u32, 0x377] {
+            let first = 0xD400_0001 | op << 16;
+            stores_v1(&[first, 0x0201_0100]).unwrap();
+            // src1 = src2 = literal 0x76543210
+            stores_v1(&[first | 3 << 11, 0x03FD_FF00, 0x7654_3210]).unwrap();
+        }
+    }
+
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no

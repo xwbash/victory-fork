@@ -452,9 +452,15 @@ fn need(block: usize) {
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+fn lane_uniform(p: &Program, st: &Structured, all: &[bool], threads: Option<[u32; 3]>) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
+    // The thread id's x on entry: a console wave of 64 holds 64 consecutive flat ids, so x
+    // shifted right by 6 or more is one number in all of them while the group's rows are
+    // whole waves (x a multiple of 64) or fit in one (x up to 64): the wave's number, which
+    // compute programs that share totals between the waves of a group index LDS with.
+    let thread_x = p.inputs.iter().find(|(r, _)| *r == Reg::V(0)).map(|&(_, v)| v);
+    let rows_whole = threads.is_some_and(|[x, _, _]| x <= 64 || x.is_multiple_of(64));
     for b in crate::ir::reverse_postorder(&p.blocks) {
         let block = &p.blocks[b];
         let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
@@ -465,6 +471,36 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
+            if st.guards[b][i].is_none()
+                && name == "v_lshrrev_b32"
+                && rows_whole
+                && let Fields::Valu(v) = &inst.fields
+                && v.dpp.is_none()
+                && v.sdwa.is_none()
+                && let [shift, Operand::Vector { reg, .. }] = v.src.as_slice()
+                && let Some(k) = match *shift {
+                    Operand::Const(c) => crate::resource::inline(c),
+                    Operand::Literal(x) => Some(x),
+                    _ => None,
+                }
+                && (6..32).contains(&k)
+                && thread_x.is_some()
+                && inst.read(Reg::V(*reg)) == thread_x
+            {
+                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+                continue;
+            }
+            // An LDS read at an address every lane holds alike reads one dword for all of them
+            // (`ds_read_addtid` adds the lane's number; swizzles and permutes read other lanes).
+            if let Fields::Ds { addr: Some(Operand::Vector { reg, .. }), gds: false, .. } = &inst.fields
+                && name.starts_with("ds_read")
+                && !name.contains("addtid")
+                && st.guards[b][i].is_none()
+                && inst.read(Reg::V(*reg)).is_some_and(|a| same.contains(&a))
+            {
+                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+                continue;
+            }
             let ops: Vec<Operand> = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
@@ -1262,6 +1298,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -1462,6 +1499,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let threads = s.threads;
         Lower {
             s,
             x,
@@ -1507,7 +1545,7 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, threads),
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -7187,6 +7225,67 @@ impl<'a> Lower<'a> {
                         .or_insert(Val::Missing("a lane mask read as data"));
                 }
                 Ok(())
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // A gather inside each row of 16 lanes (`permlane16`), or from
+                // the other row of the pair (`permlanex16`): lane 16r + i reads
+                // lane 16r' + nibble i of {src2, src1}. The ISA keeps both
+                // inside 32-lane halves, so a console wave64 program run as two
+                // host waves of 32 needs no exchange. OPSEL bit 0 is FI (read
+                // source lanes outside EXEC too), bit 1 BOUND_CTRL (a source
+                // lane outside EXEC gives 0; else the destination keeps its
+                // value).
+                // shortcut: a source lane that left through a branch (not a
+                // guard) is read as the host gives it, as `ds_bpermute`.
+                self.cross_lane(false)?;
+                let x = s(self, 0)?;
+                let (lo, hi) = (s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let (k15, k7, k3, k2) = (
+                    self.s.m.i32(15),
+                    self.s.m.i32(7),
+                    self.s.m.i32(3),
+                    self.s.m.i32(2),
+                );
+                let i = self.s.m.bin(c, Bin::And, lane, k15);
+                let upper = self.s.m.bin(c, Bin::LShr, i, k3);
+                let zero = self.s.m.i32(0);
+                let upper = self.s.m.cmp(c, pred::NE, upper, zero);
+                let word = self.s.m.select(c, upper, hi, lo);
+                let nibble = self.s.m.bin(c, Bin::And, i, k7);
+                let shift = self.s.m.bin(c, Bin::Shl, nibble, k2);
+                let pick = self.s.m.bin(c, Bin::LShr, word, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let not15 = self.s.m.i32(!15);
+                let row = self.s.m.bin(c, Bin::And, lane, not15);
+                let row = if name == "v_permlanex16_b32" {
+                    let k16 = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::Xor, row, k16)
+                } else {
+                    row
+                };
+                let src = self.s.m.bin(c, Bin::Or, row, pick);
+                let mut r = self.read_lane(x, src);
+                let (fetch_inactive, bound_ctrl) = (v.opsel & 1 != 0, v.opsel & 2 != 0);
+                if let (Some(g), false) = (guard, fetch_inactive) {
+                    let one = self.s.m.i32(1);
+                    let mine = self.s.m.select(c, g, one, zero);
+                    let theirs = self.read_lane(mine, src);
+                    let on = self.s.m.cmp(c, pred::NE, theirs, zero);
+                    let off = if bound_ctrl {
+                        zero
+                    } else {
+                        match v.dst {
+                            Some(Operand::Vector { reg, .. }) => match inst.read(Reg::V(reg)) {
+                                Some(old) => self.i32_of(old)?,
+                                None => zero,
+                            },
+                            _ => return Err("a lane permute result"),
+                        }
+                    };
+                    r = self.s.m.select(c, on, r, off);
+                }
+                int(self, r)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
