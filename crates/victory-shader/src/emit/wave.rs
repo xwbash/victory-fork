@@ -100,8 +100,8 @@ fn buddies(a: u64, b: u64) -> bool {
 pub(crate) enum Sym {
     Unknown,
     K(u32),
-    /// The lane's own value of a VGPR value from before the section.
-    Own(Value),
+    /// Lane `u8`'s value of a VGPR value from before the section.
+    Own(Value, u8),
     /// A uniform value from before the section.
     Uni(Value),
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
@@ -326,7 +326,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(x) => vec
                         .get(&x)
                         .cloned()
-                        .unwrap_or_else(|| (0..wave).map(|_| Sym::Own(x)).collect()),
+                        .unwrap_or_else(|| (0..wave).map(|l| Sym::Own(x, l as u8)).collect()),
                     None => one(Sym::Unknown),
                 },
                 Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
@@ -422,7 +422,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
+                        (Sym::K(ident), Some(Sym::Own(x, from)), Some(m))
+                            if usize::from(from) == l && masked.contains(&m) =>
+                        {
                             Sym::Red {
                                 op: None,
                                 src: x,
@@ -552,7 +554,7 @@ fn shapes(
     let mut out = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
-        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
             op: Some(op),
             src,
@@ -592,10 +594,18 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     {
         return Some(Shape::Masked(m.0, m.1, m.2));
     }
+    if let Sym::Own(x, 0) = first
+        && lanes
+            .iter()
+            .enumerate()
+            .all(|(l, &s)| s == Sym::Own(x, l as u8))
+    {
+        return Some(Shape::Value(x));
+    }
     if lanes.iter().all(|&s| s == first) {
         return match first {
             Sym::K(k) => Some(Shape::K(k)),
-            Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
+            Sym::Uni(x) => Some(Shape::Value(x)),
             Sym::Red {
                 op: Some(op),
                 src,
@@ -1059,6 +1069,50 @@ mod tests {
                 .collect();
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
+        }
+    }
+
+    #[test]
+    fn cross_lane_ops_on_pre_section_vgpr_do_not_collapse_to_identity() {
+        for wave64 in [false, true] {
+            let save_op = if wave64 { 0x25 } else { 0x3D };
+            let mov_exec = if wave64 { 0x04 } else { 0x03 };
+            let mut w = Vec::new();
+            w.push(sop1(0, save_op, 193)); // 0: s_or_saveexec s0/s[0:1], -1
+            w.push(vop1(1, 0x01, 256)); // 1: v_mov_b32 v1, v0 (identity)
+            w.extend(vop3(2, 0x101, 128, 256, 0)); // 2: v_cndmask_b32 v2, 0, v0, s0 (masked)
+            w.extend(vop3(3, 0x360, 256, 128 + 5, 0)); // 3: v_readlane_b32 s3, v0, 5
+            w.push(vop1(3, 0x01, 3)); // 4: v_mov_b32 v3, s3 (broadcast of lane 5)
+            w.push(vop1(4, 0x01, 0xFA)); // 5: v_mov_b32_dpp v4, v0 row_mirror bound_ctrl:1
+            w.push(dpp16(0, 0x140, 0xF, 0xF, true));
+            w.extend(vop3(5, 0x378, 256, 128, 128)); // 6: v_permlanex16_b32 v5, v0, 0, 0
+            w.extend(vop3(6, 0x101, 128, 260, 0)); // 7: v_cndmask_b32 v6, 0, v4, s0
+            w.push(sop1(EXEC, mov_exec, 0)); // 8: s_mov exec, saved
+
+            let p = build(&w, wave64);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(0)).unwrap();
+            let v0_in = p
+                .inputs
+                .iter()
+                .find_map(|&(r, v)| (r == Reg::V(0)).then_some(v))
+                .unwrap();
+            let v1 = insts[1].write(Reg::V(1)).unwrap();
+            let v2 = insts[2].write(Reg::V(2)).unwrap();
+            let s3 = insts[3].write(Reg::S(3)).unwrap();
+            let v3 = insts[4].write(Reg::V(3)).unwrap();
+            let v4 = insts[5].write(Reg::V(4)).unwrap();
+            let v5 = insts[6].write(Reg::V(5)).unwrap();
+            let v6 = insts[7].write(Reg::V(6)).unwrap();
+            let sec = &sections(&p, 0)[&0];
+
+            assert_eq!(sec.shapes.get(&v1), Some(&Shape::Value(v0_in)));
+            assert_eq!(sec.shapes.get(&v2), Some(&Shape::Masked(v0_in, saved, 0)));
+            assert_eq!(sec.shapes.get(&s3), None);
+            assert_eq!(sec.shapes.get(&v3), None);
+            assert_eq!(sec.shapes.get(&v4), None);
+            assert_eq!(sec.shapes.get(&v5), None);
+            assert_eq!(sec.shapes.get(&v6), None);
         }
     }
 }
