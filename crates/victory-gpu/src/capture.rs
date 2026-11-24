@@ -117,7 +117,7 @@ const RING_LINES: usize = 6000;
 /// Whether `VICTORY_CAPTURE_WORLD` is set.
 fn world_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
+    *ON.get_or_init(|| crate::host::env_flag("VICTORY_CAPTURE_WORLD"))
 }
 
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
@@ -342,7 +342,7 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| folder().is_some() && crate::host::env_flag("VICTORY_DUMP_TARGETS"))
 }
 
 /// Notes a title texture the frame being built renders to or writes.
