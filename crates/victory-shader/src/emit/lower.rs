@@ -3636,6 +3636,36 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Operand `k` for typeless `_b32` operations whose VOP3 `abs`/`neg`
+    /// modifiers act bitwise on the sign bit without flushing subnormals or
+    /// quieting signalling NaNs.
+    fn src_bitwise(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let mut x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => {
+                let x = self.operand(inst, &op)?;
+                match Self::sdwa_src(inst, k) {
+                    Some((sel, sext)) => self.select_bits(x, sel, sext),
+                    None => x,
+                }
+            }
+        };
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, sign);
+        }
+        Ok(x)
+    }
+
     fn unary(&mut self, op: u32, f: V) -> V {
         self.s.op(
             self.cur,
@@ -7593,11 +7623,11 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
+                if v.clamp || v.omod != 0 {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
+                let a = self.src_bitwise(inst, 0)?;
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -7946,13 +7976,25 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_cvt_pkrtz_f16_f32" => {
-                let (a, bb) = (f(self, 0)?, f(self, 1)?);
+                if v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                let (mut a, mut bb) = (f(self, 0)?, f(self, 1)?);
+                if v.clamp {
+                    a = self.unary(7, a);
+                    bb = self.unary(7, bb);
+                }
                 let lo = self.f16_toward_zero(a);
                 let hi = self.f16_toward_zero(bb);
                 let sh = self.s.m.i32(16);
                 let hi = self.s.m.bin(c, Bin::Shl, hi, sh);
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
-                int(self, r)
+                match v.dst {
+                    Some(Operand::Vector { reg, .. }) => self.write(inst, Reg::V(reg), r, guard),
+                    Some(Operand::Scalar { code, .. }) => self.write(inst, Reg::S(code), r, None),
+                    _ => return Err("a result without a register"),
+                }
+                Ok(())
             }
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
@@ -8102,12 +8144,7 @@ impl<'a> Lower<'a> {
                     }
                     None => return Err(UNTRACKED),
                 };
-                if v.abs != 0 || v.neg != 0 {
-                    let (a, bb) = (f(self, 0)?, f(self, 1)?);
-                    let r = self.s.m.select(c, cond, bb, a);
-                    return float(self, r);
-                }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let (a, bb) = (self.src_bitwise(inst, 0)?, self.src_bitwise(inst, 1)?);
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }

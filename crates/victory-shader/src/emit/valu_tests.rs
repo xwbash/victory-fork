@@ -1502,3 +1502,95 @@ fn cvt_f32_f64_rounds_to_nearest_even() {
         );
     });
 }
+
+#[test]
+fn bitwise_mov_and_cndmask_preserve_subnormals_and_snans() {
+    let patterns: &[u32] = &[
+        0x0000_0001, // +subnormal
+        0x8000_0001, // -subnormal
+        0x7F80_0001, // +sNaN
+        0xFF80_0042, // -sNaN
+        0x0000_0000, // +0.0
+        0x8000_0000, // -0.0
+        (-1.5f32).to_bits(),
+        3.25f32.to_bits(),
+    ];
+
+    for (abs, neg, expected) in [
+        (1u8, 0u8, (|x: u32| x & 0x7FFF_FFFF) as fn(u32) -> u32),
+        (0u8, 1u8, |x: u32| x ^ 0x8000_0000),
+        (1u8, 1u8, |x: u32| x | 0x8000_0000),
+    ] {
+        let mov = build_valu_cs(&vop3_mod(0x181, 0, vgpr(1), 0, 0, abs, neg, 0, false));
+        let cases: Vec<[u32; 4]> = patterns.iter().map(|&x| [x, 0, 0, 0]).collect();
+        run_cases(&mov, &cases, |backend, _, inp, got| {
+            let want = expected(inp[0]);
+            assert_eq!(
+                got, want,
+                "{backend}: v_mov_b32(abs={abs}, neg={neg}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0],
+            );
+        });
+    }
+
+    // v_cmp_ne_u32_e64 s6, v3, 0; v_cndmask_b32_e64 v0, |v1|, -v2, s6
+    let cmp = vop3(0x0c5, 6, vgpr(3), 0x80, 0);
+    let sel = vop3_mod(0x101, 0, vgpr(1), vgpr(2), sgpr(6), 1, 2, 0, false);
+    let cnd = build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]]);
+    let mut cases = Vec::new();
+    for &x in patterns {
+        cases.push([x, x, 0, 0]);
+        cases.push([x, x, 1, 0]);
+    }
+    run_cases(&cnd, &cases, |backend, _, inp, got| {
+        let want = if inp[2] != 0 {
+            inp[1] ^ 0x8000_0000
+        } else {
+            inp[0] & 0x7FFF_FFFF
+        };
+        assert_eq!(
+            got, want,
+            "{backend}: v_cndmask_b32(|{:#010x}|, -{:#010x}, {}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_cvt_pkrtz_f16_f32_honors_clamp() {
+    // v_cvt_pkrtz_f16_f32 v0, v1, v2 clamp
+    let clamped = build_valu_cs(&vop3_mod(0x12f, 0, vgpr(1), vgpr(2), 0, 0, 0, 0, true));
+    let cases: &[([u32; 4], u32)] = &[
+        ([(-1.0f32).to_bits(), 2.0f32.to_bits(), 0, 0], 0x3C00_0000),
+        ([0.5f32.to_bits(), 0.25f32.to_bits(), 0, 0], 0x3400_3800),
+        ([0x7FC0_0000, (-0.0f32).to_bits(), 0, 0], 0x0000_0000),
+        (
+            [f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), 0, 0],
+            0x0000_3C00,
+        ),
+        // 1.0 - 2^-24 stays strictly below 1.0 and rounds toward zero to 0x3BFF.
+        ([0x3F7F_FFFF, 1.0f32.to_bits(), 0, 0], 0x3C00_3BFF),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&clamped, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_pkrtz_f16_f32 clamp({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    // With source neg on both inputs: -(-2.0) -> 2.0 -> 1.0, -(0.5) -> -0.5 -> 0.0.
+    let neg_clamped = build_valu_cs(&vop3_mod(0x12f, 0, vgpr(1), vgpr(2), 0, 0, 3, 0, true));
+    run_cases(
+        &neg_clamped,
+        &[[(-2.0f32).to_bits(), 0.5f32.to_bits(), 0, 0]],
+        |backend, _, _, got| {
+            assert_eq!(
+                got, 0x0000_3C00,
+                "{backend}: v_cvt_pkrtz_f16_f32(-v1, -v2) clamp = {got:#010x}",
+            );
+        },
+    );
+}
