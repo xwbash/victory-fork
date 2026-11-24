@@ -911,6 +911,10 @@ mod tests {
 
     /// A wave64 compute program: `body`, then a store of v1 to a UAV.
     fn stores_v1(body: &[u32]) -> Result<(), ShaderError> {
+        stores_v1_with(body, |p| p)
+    }
+
+    fn stores_v1_with(body: &[u32], form: impl FnOnce(ir::Program) -> ir::Program) -> Result<(), ShaderError> {
         use crate::native::RootParam;
         use crate::{ResourceType, RootType, UsedResource};
         // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
@@ -947,13 +951,35 @@ mod tests {
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let p = form(ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap());
         let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
         emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+    }
+
+    #[test]
+    fn masked_vector_output_keeps_the_outer_restore_guard() {
+        for (nested, inner) in [
+            (false, &[0xBEFE_040C][..]),               // restore pre-branch EXEC
+            (true, &[0xBE90_246A, 0xBEFE_0410][..]),  // save and restore inner EXEC
+        ] {
+            let mut body = vec![
+                0x7E02_0287, // v_mov_b32 v1, 7
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0000 | (inner.len() as u32 + 1),
+            ];
+            body.extend_from_slice(inner);
+            body.extend([0x7E02_0289, 0xBEFE_040C]); // v1 = 9; restore outer EXEC
+            stores_v1_with(&body, |p| {
+                let walked = ir::without_skips(&p, true);
+                assert_eq!(walked.is_some(), nested);
+                walked.unwrap_or(p)
+            }).unwrap();
+        }
     }
 
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
