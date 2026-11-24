@@ -1375,22 +1375,52 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: forwards occlusion queries to the host
+/// GPU when `VICTORY_REAL_OCCLUSION=1` is enabled.
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if crate::query::real_occlusion()
+        && let Some(query_type) = crate::query::occlusion_query_type(kind)
+        && let Some((host_heap, count)) = crate::query::host_heap(heap)
+        && index < count
+        && let Some(list) = host_list(this)
+    {
+        // SAFETY: live command list and query heap; index bounds checked above.
+        unsafe { list.list.BeginQuery(&host_heap, query_type, index) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `EndQuery(heap, type, index)`: forwards occlusion queries to the host
+/// GPU when `VICTORY_REAL_OCCLUSION=1` is enabled.
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if crate::query::real_occlusion()
+        && let Some(query_type) = crate::query::occlusion_query_type(kind)
+        && let Some((host_heap, count)) = crate::query::host_heap(heap)
+        && index < count
+        && let Some(list) = host_list(this)
+    {
+        // SAFETY: live command list and query heap; index bounds checked above.
+        unsafe { list.list.EndQuery(&host_heap, query_type, index) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// each query's result into the buffer once the list has run. When
+/// `VICTORY_REAL_OCCLUSION=1` is enabled, occlusion and binary-occlusion
+/// queries resolve directly from the host GPU into the destination buffer's
+/// shadow copy (and copy back to title memory). Otherwise timestamps (type 2)
+/// are the GPU clock then; occlusion counts (0) say a million samples passed
+/// and binary occlusion (1) visible, so nothing is culled by a query.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
@@ -1409,9 +1439,39 @@ extern "system" fn resolve_queries(
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
-    if offset + u64::from(count) * bytes > size {
+    let Some(byte_len) = u64::from(count).checked_mul(bytes) else {
+        return;
+    };
+    if offset.checked_add(byte_len).is_none_or(|end| end > size) {
         return;
     }
+    #[cfg(windows)]
+    if crate::query::real_occlusion()
+        && let Some(query_type) = crate::query::occlusion_query_type(kind)
+        && let Some((host_heap, heap_count)) = crate::query::host_heap(heap)
+        && crate::query::resolve_range_valid(first, count, heap_count)
+        && let Some(list) = host_list(this)
+        && let Some(dst_addr) = (data as u64).checked_add(offset)
+        && let Some(shadow) = crate::shadow::find(dst_addr, byte_len)
+    {
+        shadow.refresh(list, dst_addr, byte_len);
+        shadow.gpu_writes(list, dst_addr, byte_len);
+        let dst_offset = shadow.offset(dst_addr);
+        // SAFETY: live command list, query heap, and shadow buffer; range checked above.
+        unsafe {
+            list.list.ResolveQueryData(
+                &host_heap,
+                query_type,
+                first,
+                count,
+                &shadow.buffer,
+                dst_offset,
+            );
+        }
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = (heap, first);
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
@@ -2165,8 +2225,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, begin_query as *const ()),       // 0xe0 BeginQuery
+    (29, end_query as *const ()),         // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
