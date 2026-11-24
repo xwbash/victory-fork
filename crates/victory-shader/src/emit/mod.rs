@@ -1767,4 +1767,117 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    /// System values declared with non-canonical casing in the console
+    /// signature (e.g. `SV_POSITION`, `SV_TARGET`) must emit DXIL's canonical
+    /// semantic names in `ISG1`/`OSG1`, otherwise `dxil.dll` rejects the
+    /// container part as not matching the module.
+    #[test]
+    fn non_canonical_system_value_names_validate_in_isg1_and_osg1() {
+        let build_ps = |inputs: Vec<SigElement>, outputs: Vec<SigElement>, flags: u64| {
+            let mut s = super::shader::Shader::new(true);
+            s.flags = flags;
+            s.inputs = inputs;
+            s.outputs = outputs;
+            let entry = s.entry;
+            let z = s.m.f32(0);
+            for col in 0..4u8 {
+                let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), z];
+                s.op(entry, "storeOutput.f32", super::bitcode::Attr::NoUnwind, s.t.void, 5, &args);
+            }
+            s.m.terminate(entry, super::bitcode::Term::Ret);
+            s.finish()
+        };
+        let mut target = element("SV_TARGET", 16, 0);
+        target.usage = 15;
+        for (name, kind, comp, interp, row, cols, flags) in [
+            ("SV_POSITION", 3, 9, 4, Some(0), 4, 0u64),
+            ("SV_ISFRONTFACE", 13, 5, 1, Some(0), 1, 0),
+            ("SV_SAMPLEINDEX", 12, 5, 0, None, 1, 0),
+            ("SV_PRIMITIVEID", 10, 5, 1, Some(0), 1, 0),
+            ("SV_BARYCENTRICS", 28, 9, 2, None, 3, 0x40_0000),
+            ("SV_RENDERTARGETARRAYINDEX", 4, 5, 1, Some(0), 1, 0),
+            ("SV_VIEWPORTARRAYINDEX", 5, 5, 1, Some(0), 1, 0),
+            ("SV_CLIPDISTANCE", 6, 9, 2, Some(0), 1, 0),
+            ("SV_CULLDISTANCE", 7, 9, 2, Some(0), 1, 0),
+        ] {
+            let el = SigElement {
+                name: name.into(),
+                index: 0,
+                kind,
+                comp,
+                interp,
+                row,
+                col: 0,
+                cols,
+                usage: 0,
+                half: false,
+            };
+            let dxil = build_ps(vec![el], vec![target.clone()], flags);
+            #[cfg(windows)]
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut dxil.clone())
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+            let c = Container::parse(&dxil).unwrap();
+            let isg1 = signature(c.part(FourCC::ISG1).unwrap().data).unwrap();
+            assert_ne!(isg1[0].name, name, "expected canonical name for {name}");
+            let osg1 = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+            assert_eq!(osg1[0].name, "SV_Target");
+        }
+    }
+
+    /// Two elements sharing the same input register row in reverse column
+    /// order keep their element order in `ISG1`, matching `dxil.dll`.
+    #[test]
+    fn shared_row_elements_keep_element_order_in_isg1() {
+        let mut s = super::shader::Shader::new(true);
+        let hi = SigElement {
+            name: "COLOR".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(0),
+            col: 2,
+            cols: 2,
+            usage: 0,
+            half: false,
+        };
+        let lo = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(0),
+            col: 0,
+            cols: 2,
+            usage: 0,
+            half: false,
+        };
+        s.inputs = vec![hi, lo];
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        s.outputs = vec![target];
+        let entry = s.entry;
+        let z = s.m.f32(0);
+        for col in 0..4u8 {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), z];
+            s.op(entry, "storeOutput.f32", super::bitcode::Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.m.terminate(entry, super::bitcode::Term::Ret);
+        let dxil = s.finish();
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut dxil.clone()).unwrap();
+        }
+        let c = Container::parse(&dxil).unwrap();
+        let isg1 = signature(c.part(FourCC::ISG1).unwrap().data).unwrap();
+        assert_eq!((isg1[0].name.as_str(), isg1[1].name.as_str()), ("COLOR", "TEXCOORD"));
+    }
 }
