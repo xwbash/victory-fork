@@ -300,21 +300,24 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     true
 }
 
-/// Runs what waiting queues hold as far as their fences have been reached
-/// (`all`: all of it), each queue's in the order it was given. Called
-/// where a fence may have moved: after a signal and after a submission (a
-/// list's bottom-of-pipe write may be into a fence), never from inside
-/// one.
+/// Runs what waiting queues hold as far as their fences have been reached,
+/// each queue's in the order it was given. With `force`, bypass waits only
+/// after running all ready work. Called after a signal or a submission
+/// (a list's bottom-of-pipe write may be into a fence), never inside one.
 #[cfg(windows)]
-pub(crate) fn release_held(all: bool) {
+pub(crate) fn release_held(force: bool) {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
     let _one = lock(&RELEASING);
+    let mut forcing = false;
     loop {
         let queues = lock(&WAITING).clone();
+        if queues.is_empty() {
+            break;
+        }
         let mut moved = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
@@ -324,11 +327,11 @@ pub(crate) fn release_held(all: bool) {
                 match held.first() {
                     None => break,
                     Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                        if !forcing && crate::fence::completed(fence as This) < value =>
                     {
                         break;
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(Held::Value(wait)) if !forcing && !value_met(wait) => break,
                     Some(_) => {}
                 }
                 match held.remove(0) {
@@ -336,7 +339,7 @@ pub(crate) fn release_held(all: bool) {
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
-                        if all && !value_met(&wait) {
+                        if forcing && !value_met(&wait) {
                             static SEEN: AtomicU64 = AtomicU64::new(0);
                             if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
                                 tracing::warn!(
@@ -351,7 +354,7 @@ pub(crate) fn release_held(all: bool) {
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
-                                "RUN held submission of {} lists (forced {all})",
+                                "RUN held submission of {} lists (forced {forcing})",
                                 order.len()
                             )
                         });
@@ -392,7 +395,7 @@ pub(crate) fn release_held(all: bool) {
                                 crate::list::recycle(lists, &order);
                             }
                         }
-                        if all {
+                        if forcing {
                             #[cfg(feature = "diagnostics")]
                             crate::copystat::add(crate::copystat::C::Forced, 1);
                             static ONCE: AtomicBool = AtomicBool::new(false);
@@ -418,7 +421,10 @@ pub(crate) fn release_held(all: bool) {
             }
         }
         if !moved {
-            break;
+            if !force || forcing {
+                break;
+            }
+            forcing = true;
         }
     }
 }
@@ -769,13 +775,9 @@ extern "system" fn present(
         crate::host::settle_for_present();
         release_held(false);
         crate::host::settle_for_present();
-    } else if crate::host::late() {
-        // The present is sent ahead too: what waits for a value a flight
-        // will write runs behind that flight, and nothing is settled here.
-        release_held(false);
     }
-    // shortcut: what a queue still holds at a present runs now, whatever
-    // its fence: a wait is not kept across frames.
+    // Ready work runs first, including work that can follow an in-flight
+    // memory write. The fallback runs whatever remains held at a present.
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1044,6 +1046,53 @@ mod tests {
             7
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn present_runs_ready_fence_producer_before_blocked_consumer() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut consumer = null;
+        let mut producer = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut consumer), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut producer), S_OK);
+        let mut fences = [null; 3];
+        for fence in &mut fences {
+            assert_eq!(
+                crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], fence),
+                S_OK
+            );
+        }
+        let [ready, dependency, sequence] = fences;
+
+        assert_eq!(wait(consumer, dependency, 1), S_OK);
+        assert_eq!(signal(consumer, sequence, 2), S_OK);
+        assert_eq!(wait(producer, ready, 1), S_OK);
+        assert_eq!(signal(producer, sequence, 1), S_OK);
+        assert_eq!(signal(producer, dependency, 1), S_OK);
+        assert_eq!(crate::fence::completed(sequence), 0);
+
+        // A fence signal publishes its value before it wakes waiting queues.
+        // Let a present enter in that interval.
+        crate::fence::set(ready, 1);
+        assert_eq!(present(consumer, 0, null.cast(), null.cast()), S_OK);
+        let last = crate::fence::completed(sequence);
+        for q in [consumer, producer] {
+            assert_eq!(release(q), 0);
+        }
+        for fence in fences {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence),
+                0
+            );
+        }
+        assert_eq!(last, 2, "the consumer must signal after the producer");
     }
 
     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
