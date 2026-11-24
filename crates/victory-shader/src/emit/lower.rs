@@ -11430,8 +11430,11 @@ impl<'a> Lower<'a> {
         // runs to the limit in every lane. A million iterations a pixel
         // hung the GPU for seconds a draw until Windows reset it
         // (PS_Textured_Eight, 2026-11-24, run 12).
-        // shortcut: a pixel loop past 128 iterations, a vertex or mesh loop
-        // past 256 or a compute loop past 4,096 is cut short. (They were
+        // shortcut: a pixel loop past 128 iterations, or a vertex, mesh or
+        // compute loop past 256 is cut short. A tester on an RTX 3060 Ti
+        // with the default 2 s TDR reported 256 stable for 8 minutes and
+        // 1,024 ending in device removal after 7 minutes (issue #18).
+        // (The limits were
         // 1,024, 4,096 and 65,536: the opening cutscene then lost the card
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
@@ -11439,7 +11442,7 @@ impl<'a> Lower<'a> {
         let limit = match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
+            LOOP_LIMIT => 1 << 8,
             named => named,
         };
         let limit = self.s.m.i32(limit);
