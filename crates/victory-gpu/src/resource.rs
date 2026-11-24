@@ -3680,18 +3680,18 @@ float4 lit() : SV_Target { return 1.0; }
             flags,
         };
         // R9G9B9E5_SHAREDEXP (67) with ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS (5)
-        // and a non-null clear value: PC GPUs refuse both RT and typed UAV on this
-        // format; dropping both flags and omitting pOptimizedClearValue lets
-        // CreateCommittedResource succeed without id=599 / id=815, and Host::rtv
-        // returns None instead of triggering 0x887A0001.
+        // and a non-null clear value: no PC GPU renders to this format, so 16-bit float
+        // RGBA stands in for it (PR #32, `target_format`) and keeps both uses, which the
+        // stand-in supports; the flags are dropped only where a format refuses them.
         let clear = [67u32, 0, 0, 0, 0];
         let shared_exp = host_texture(&make(67, 5), 0, clear.as_ptr().cast(), false)
-            .expect("R9G9B9E5_SHAREDEXP texture should succeed with unsupported flags dropped");
+            .expect("an R9G9B9E5 target is made with its stand-in format");
         // SAFETY: live D3D12 resource.
         let d = unsafe { shared_exp.GetDesc() };
-        assert_eq!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, 0);
-        assert_eq!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0, 0);
-        assert!(host.rtv(Some(&shared_exp), None).is_none());
+        assert_eq!(d.Format, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert_ne!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, 0);
+        assert_ne!(d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0, 0);
+        assert!(host.rtv(Some(&shared_exp), None).is_some());
 
         // R8G8B8A8_TYPELESS (27) with flags=5 must keep ALLOW_UNORDERED_ACCESS.
         let typeless = host_texture(&make(27, 5), 0, std::ptr::null(), false)
