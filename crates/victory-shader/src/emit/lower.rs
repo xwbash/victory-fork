@@ -243,6 +243,12 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// Per IR block whether every lane runs it ([`all_lane_blocks`]), once asked
+    /// ([`Self::lane_there`]).
+    every: Option<Option<Vec<bool>>>,
+    /// The VGPRs some `v_writelane_b32` of the program writes, once asked: their lanes hold
+    /// scalars, and a lane read of one needs its lane as the write does.
+    lane_written: Option<HashSet<u8>>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -332,6 +338,11 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+
+/// A lane write or read (`v_writelane_b32`, `v_readlane_b32`) in a block only some lanes run:
+/// the console writes and reads the lane whatever EXEC is, and the lane named may be one
+/// that is not there ([`Lower::lane_there`]).
+pub(super) const LANE_ELSEWHERE: Why = "a lane written or read where not every lane runs";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -1172,6 +1183,21 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_lanes_as_they_stand`].
+    static LANES_AS_THEY_STAND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with lane writes and reads lowered wherever they stand, among the lanes that are
+/// there ([`LANE_ELSEWHERE`] is not raised, and a write is under its lane's own guard).
+/// shortcut: a write to a lane that is elsewhere or outside EXEC is lost, and a read of one
+/// gives what the host gives. The last resort for a program whose branches around such an
+/// access the wave cannot take together ([`super::widen`]); upgrade by keeping the lanes of
+/// such a VGPR as scalars (`ir::unspill` for a VGPR with other uses).
+pub(super) fn with_lanes_as_they_stand<R>(f: impl FnOnce() -> R) -> R {
+    let was = LANES_AS_THEY_STAND.replace(true);
+    let r = f();
+    LANES_AS_THEY_STAND.set(was);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1727,6 +1753,8 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
+            every: None,
+            lane_written: None,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -3945,6 +3973,48 @@ impl<'a> Lower<'a> {
         let both = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
+    }
+
+    /// A lane write or read needs the lane it names where it stands: refused in a block only
+    /// some lanes run (the lane may be one of the others, and the console writes and reads
+    /// it all the same). The block is named for [`super::widen`], which has the wave take
+    /// the branches around it together, so that every lane is there. Not under
+    /// [`with_lanes_as_they_stand`], nor where each host wave is a wave of its own.
+    fn lane_there(&mut self) -> Result<(), Why> {
+        if LANES_AS_THEY_STAND.get() || self.local {
+            return Ok(());
+        }
+        let b = self.cur_ir;
+        let every = self.every.get_or_insert_with(|| all_lane_blocks(self.x.st));
+        // (an indirect exit: not known, taken as before)
+        if every.as_ref().is_some_and(|all| !all.get(b).copied().unwrap_or(true)) {
+            need(b);
+            return Err(LANE_ELSEWHERE);
+        }
+        Ok(())
+    }
+
+    /// Whether some lane of the console wave has `bit`, asked where the lowering stands: the
+    /// host wave's answer, which two host waves that exchange give each other (as
+    /// [`Self::wave_wide`]; every lane must be there for that).
+    fn some_lane(&mut self, bit: V) -> Result<V, Why> {
+        let c = self.cur;
+        let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+        let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
+            return Ok(some);
+        }
+        if !self.all_lanes(self.cur_ir) {
+            need(self.cur_ir);
+            return Err(LANE_ELSEWHERE);
+        }
+        let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
+        let (lo, hi) = self.exchange_halves(c, some);
+        let c = self.cur;
+        let both = self.s.m.bin(c, Bin::Or, lo, hi);
+        let z = self.s.m.i32(0);
+        Ok(self.s.m.cmp(c, pred::NE, both, z))
     }
 
     /// Whether every lane runs IR block `b` (always true without `exchange`).
@@ -7661,6 +7731,26 @@ impl<'a> Lower<'a> {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
+                    // A lane of a VGPR that lane writes fill (a scalar kept there): the
+                    // console reads it whether the lane is in EXEC or not, and a lane that
+                    // is not here has no value the host would give.
+                    let p = self.x.p;
+                    let written = self.lane_written.get_or_insert_with(|| {
+                        let insts = p.blocks.iter().flat_map(|b| &b.insts);
+                        insts
+                            .filter(|i| i.name() == "v_writelane_b32")
+                            .filter_map(|i| match &i.fields {
+                                Fields::Valu(v) => match v.dst {
+                                    Some(Operand::Vector { reg, .. }) => Some(reg),
+                                    _ => None,
+                                },
+                                _ => None,
+                            })
+                            .collect()
+                    });
+                    if matches!(v.src.first(), Some(Operand::Vector { reg, .. }) if written.contains(reg)) {
+                        self.lane_there()?;
+                    }
                 }
                 if let Some(slot) = self.exchange.as_ref().map(|e| e.0) {
                     if self.local && self.local_any {
@@ -7715,8 +7805,24 @@ impl<'a> Lower<'a> {
                 if self.local && !self.local_any {
                     return Err("a lane write in a half-wave");
                 }
+                self.lane_there()?;
                 let me = self.console_lane();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
+                // The console writes the lane whatever EXEC is, once the wave gets here. Under
+                // a guard (lanes are here with EXEC clear: a skip left out, a branch the wave
+                // takes together) the lane takes the scalar when some lane is in EXEC, with
+                // or without its own bit.
+                // shortcut: "the wave is here" is read as "some lane is in EXEC". A wave that
+                // walks on with EXEC empty and no skip writes too; upgrade if a program does.
+                if let Some(g) = guard
+                    && !LANES_AS_THEY_STAND.get()
+                {
+                    let some = self.some_lane(g)?;
+                    let c = self.cur;
+                    let is = self.s.m.bin(c, Bin::And, is, some);
+                    let r = self.s.m.select(c, is, a, old);
+                    return self.write_i(inst, r, None);
+                }
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
