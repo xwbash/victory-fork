@@ -382,6 +382,81 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
+/// The console's float mode reads f32 denormal operands of `v_min/max/min3/max3/med3_f32`
+/// as zeros of their sign, and those orders put -0 below +0 (`v_med3_f32` too). The host's
+/// own denormal mode varies (WARP and an RX 7700 flush, an RX 6700 XT does not), so both are
+/// decided on the bits.
+#[test]
+fn min_max_and_med3_read_denormals_as_signed_zeros() {
+    fn ftz(x: u32) -> u32 {
+        if x & 0x7F80_0000 == 0 {
+            x & 0x8000_0000
+        } else {
+            x
+        }
+    }
+    /// `a < b` in the hardware's order, on flushed operands: -0 below +0.
+    fn lt(a: u32, b: u32) -> bool {
+        let (fa, fb) = (f32::from_bits(a), f32::from_bits(b));
+        fa < fb || (fa == fb && a == 0x8000_0000 && b == 0)
+    }
+    fn min(a: u32, b: u32) -> u32 {
+        if lt(b, a) { b } else { a }
+    }
+    fn max(a: u32, b: u32) -> u32 {
+        if lt(a, b) { b } else { a }
+    }
+    let values = [
+        0,           // +0
+        0x8000_0000, // -0
+        0x0000_0001, // +denormal
+        0x8000_0001, // -denormal
+        0x007F_FFFF, // largest +denormal
+        0x0080_0000, // smallest +normal
+        0xBF80_0000, // -1.0
+    ];
+    let mut inputs = Vec::new();
+    for a in values {
+        for b in values {
+            for c in values {
+                inputs.push([a, b, c, 0]);
+            }
+        }
+    }
+    type Want = fn(u32, u32, u32) -> u32;
+    let ops: [(&str, u16, Want); 5] = [
+        ("v_min_f32", 0x10F, |a, b, _| min(a, b)),
+        ("v_max_f32", 0x110, |a, b, _| max(a, b)),
+        ("v_min3_f32", 0x151, |a, b, c| min(min(a, b), c)),
+        ("v_max3_f32", 0x154, |a, b, c| max(max(a, b), c)),
+        ("v_med3_f32", 0x157, |a, b, c| {
+            max(min(a, b), min(max(a, b), c))
+        }),
+    ];
+    // Per device and instruction: how many cases are wrong, and the first.
+    let mut wrong = std::collections::BTreeMap::<String, (usize, String)>::new();
+    for (name, op, want) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &inputs, |backend, _, [a, b, c, _], got| {
+            let w = want(ftz(a), ftz(b), ftz(c));
+            if got != w {
+                let first = format!(
+                    "{name}({a:#010x}, {b:#010x}, {c:#010x}) = {got:#010x}, want {w:#010x}"
+                );
+                wrong
+                    .entry(format!("{backend}: {name}"))
+                    .or_insert((0, first))
+                    .0 += 1;
+            }
+        });
+    }
+    let report: Vec<String> = wrong
+        .iter()
+        .map(|(k, (n, first))| format!("{k}: {n} wrong, first {first}"))
+        .collect();
+    assert!(wrong.is_empty(), "{}", report.join("\n"));
+}
+
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)

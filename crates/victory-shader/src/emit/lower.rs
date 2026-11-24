@@ -3392,10 +3392,35 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// A 32-bit denormal as the console's float mode reads it: a zero of its
+    /// sign, decided on the bits (the host's own denormal mode varies: WARP
+    /// flushes, an RX 6700 XT does not).
+    fn ftz(&mut self, f: V) -> V {
+        let c = self.cur;
+        let x = self.as_int(f);
+        let (exp, sign, zero) = (
+            self.s.m.i32(0x7F80_0000),
+            self.s.m.i32(0x8000_0000),
+            self.s.m.i32(0),
+        );
+        let e = self.s.m.bin(c, Bin::And, x, exp);
+        let den = self.s.m.cmp(c, pred::EQ, e, zero);
+        let s = self.s.m.bin(c, Bin::And, x, sign);
+        let r = self.s.m.select(c, den, s, x);
+        self.as_float(r)
+    }
+
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
-    /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
-    /// the compare and select DXIL specifies gives either zero.
+    /// FMax/FMin, but of the operands with denormals read as zeros
+    /// ([`Self::ftz`]) and with -0 ordered below +0 (RDNA2 ISA, `v_max_f32`),
+    /// where the compare and select DXIL specifies gives either zero.
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
+        let (a, b) = (self.ftz(a), self.ftz(b));
+        self.max_min_flushed(max, a, b)
+    }
+
+    /// [`Self::max_min`] of operands without denormals.
+    fn max_min_flushed(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
         let (ia, ib) = (self.as_int(a), self.as_int(b));
@@ -3526,16 +3551,18 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(c, pred::IUGT, abs, inf)
     }
 
-    /// The median of three. With a NaN among them the hardware gives the
-    /// minimum of the three instead (the host's minimum skips NaNs, so that
-    /// is the smallest number among them).
+    /// The median of three, of the operands with denormals read as zeros and
+    /// with -0 ordered below +0, as `v_min/max_f32` order them. With a NaN
+    /// among them the hardware gives the minimum of the three instead (the
+    /// host's minimum skips NaNs, so that is the smallest number among them).
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
-        let lo = self.binary(36, a, b);
-        let hi = self.binary(35, a, b);
-        let t = self.binary(36, hi, third);
-        let median = self.binary(35, lo, t);
-        let least = self.binary(36, lo, third);
+        let (a, b, third) = (self.ftz(a), self.ftz(b), self.ftz(third));
+        let lo = self.max_min_flushed(false, a, b);
+        let hi = self.max_min_flushed(true, a, b);
+        let t = self.max_min_flushed(false, hi, third);
+        let median = self.max_min_flushed(true, lo, t);
+        let least = self.max_min_flushed(false, lo, third);
         let nan_a = self.is_nan_f32(a);
         let nan_b = self.is_nan_f32(b);
         let nan_3 = self.is_nan_f32(third);
