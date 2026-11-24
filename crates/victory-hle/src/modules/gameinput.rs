@@ -1,7 +1,9 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
 //! (host slots 0-3); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
-//! too. A poll thread turns host state into readings (a new one per change)
+//! and also supplements the first connected pad, so connecting a controller
+//! does not disable keyboard controls.
+//! A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
@@ -449,16 +451,34 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let keyboard_pad = fallback(&keys);
         let any_pad = pads.iter().any(Option::is_some);
+        if let Some(pad) = pads.iter_mut().flatten().next() {
+            pad.buttons |= keyboard_pad.buttons;
+            pad.left_trigger = pad.left_trigger.max(keyboard_pad.left_trigger);
+            pad.right_trigger = pad.right_trigger.max(keyboard_pad.right_trigger);
+            // A pressed direction takes priority; releasing it restores the
+            // controller axis. Unpressed keys never erase physical input.
+            for (axis, key) in [
+                (&mut pad.left_x, keyboard_pad.left_x),
+                (&mut pad.left_y, keyboard_pad.left_y),
+                (&mut pad.right_x, keyboard_pad.right_x),
+                (&mut pad.right_y, keyboard_pad.right_y),
+            ] {
+                if key != 0.0 {
+                    *axis = key;
+                }
+            }
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(keyboard_pad));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1485,6 +1505,51 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn keyboard_supplements_first_connected_pad_and_releases_cleanly() {
+        let (hub, host) = fake();
+        let physical = PadState {
+            buttons: B,
+            left_y: -0.5,
+            right_x: 0.25,
+            right_trigger: 0.4,
+            ..Default::default()
+        };
+        {
+            let mut source = host.lock().unwrap();
+            // First connected need not be XInput slot zero.
+            source.pads[2] = Some(physical);
+            source.pads[3] = Some(PadState::default());
+            source.keys = vec![key(0x0D), key(b'W'), key(b'C')];
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 2).unwrap();
+        assert_eq!(pad(r).buttons, A | B);
+        assert_eq!(pad(r).left_y, 1.0);
+        assert_eq!(pad(r).right_x, 0.25);
+        assert_eq!(pad(r).right_trigger, 1.0);
+        release(r);
+        let other = current(hub, GAMEPAD_KIND, 3).unwrap();
+        assert_eq!(pad(other), PadState::default());
+        release(other);
+
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 2).unwrap();
+        assert_eq!(pad(r), physical);
+        release(r);
+
+        {
+            let mut source = host.lock().unwrap();
+            source.pads = [None; PADS];
+            source.keys = vec![key(0x0D)];
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r).buttons, A);
+        release(r);
     }
 
     #[test]

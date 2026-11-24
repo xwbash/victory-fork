@@ -156,8 +156,10 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads. While the title's window has focus, the keyboard
+supplements the first connected pad (including Enter = A). With none
+connected, it drives a stand-in pad. Keyboard directions take priority
+while pressed; releasing them restores the controller's stick values:
 
 | Keys | Pad |
 |------|-----|
@@ -167,6 +169,25 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+### Xbox controllers over Bluetooth on Linux
+
+With xpadneo, SDL's raw controller backends can detect an Xbox controller
+without receiving its buttons. @MiguVT confirmed this workaround on their
+NixOS / GE-Proton setup: set both variables before launching through umu,
+keeping your usual Proton build, prefix and arguments:
+
+```sh
+export SDL_JOYSTICK_HIDAPI=0
+export SDL_JOYSTICK_RAWINPUT=0
+```
+
+These exports apply to subsequent launches from that terminal. They make SDL
+use its Linux input backend instead of the raw backends. If using another
+terminal or a desktop launcher, set the variables there too.
+See the [xpadneo issue](https://github.com/atar-axis/xpadneo/issues/543).
+This addresses the reported physical-controller issue separately from
+VIctory's keyboard/gamepad coexistence fix.
 
 ## Commands
 
