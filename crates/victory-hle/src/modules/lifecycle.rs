@@ -162,15 +162,42 @@ fn hook(hwnd: HWND) {
     }
 }
 
+/// Whether a window message asks to close the title's window: a user close
+/// (`WM_SYSCOMMAND`/`SC_CLOSE`, e.g. close button, Alt+F4, window or taskbar
+/// menu) or a direct `WM_CLOSE` (e.g. `taskkill` without `/F`, Task Manager).
+fn is_close_message(message: u32, wparam: WPARAM) -> bool {
+    message == wm::WM_CLOSE
+        || (message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set by a test on the current thread, counts intercepted close
+    /// messages instead of terminating the test runner process.
+    static CLOSE_COUNT: std::cell::RefCell<Option<usize>> = const { std::cell::RefCell::new(None) };
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // A user close (close button, Alt+F4, window or taskbar menu); a
-    // console title never sees one, nor a WM_CLOSE from it.
-    if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+    // A user or external close (close button, Alt+F4, window or taskbar menu,
+    // or a direct WM_CLOSE from taskkill / Task Manager); a console title
+    // never sees one.
+    if is_close_message(message, wparam) {
+        #[cfg(test)]
+        if CLOSE_COUNT.with(|c| {
+            let mut count = c.borrow_mut();
+            let Some(n) = count.as_mut() else {
+                return false;
+            };
+            *n += 1;
+            true
+        }) {
+            return 0;
+        }
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -434,5 +461,60 @@ mod tests {
         }
         let seen = COMMANDS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
+    }
+
+    #[test]
+    fn wm_close_and_sc_close_are_intercepted_before_the_title() {
+        assert!(is_close_message(wm::WM_CLOSE, 0));
+        assert!(is_close_message(wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize));
+        assert!(is_close_message(
+            wm::WM_SYSCOMMAND,
+            (wm::SC_CLOSE | 0x3) as usize
+        ));
+        assert!(!is_close_message(
+            wm::WM_SYSCOMMAND,
+            wm::SC_MINIMIZE as usize
+        ));
+        assert!(!is_close_message(wm::WM_DESTROY, 0));
+
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("close"),
+            0,
+            0,
+            0,
+            10,
+            10,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+        COMMANDS.with(|c| c.borrow_mut().clear());
+        CLOSE_COUNT.with(|c| *c.borrow_mut() = Some(0));
+        // SAFETY: our window, owned by this thread, so each SendMessageW runs
+        // synchronously; original proc is restored before DestroyWindow.
+        let alive_after_close = unsafe {
+            let title = wm::GetPropW(hwnd, TITLE_PROC);
+            wm::SetPropW(hwnd, TITLE_PROC, recording as *const () as *mut c_void);
+            wm::SendMessageW(hwnd, wm::WM_CLOSE, 0, 0);
+            wm::SendMessageW(hwnd, wm::WM_SYSCOMMAND, wm::SC_CLOSE as usize, 0);
+            wm::SendMessageW(hwnd, wm::WM_SYSCOMMAND, (wm::SC_CLOSE | 1) as usize, 0);
+            let alive = wm::IsWindow(hwnd) != 0;
+            wm::SetPropW(hwnd, TITLE_PROC, title);
+            wm::DestroyWindow(hwnd);
+            alive
+        };
+        let closes = CLOSE_COUNT.with(|c| c.borrow_mut().take()).unwrap_or(0);
+        let seen = COMMANDS.with(|c| c.borrow().clone());
+        assert!(
+            alive_after_close,
+            "WM_CLOSE must not pass to DefWindowProcW"
+        );
+        assert_eq!(closes, 3);
+        assert!(seen.is_empty());
     }
 }
