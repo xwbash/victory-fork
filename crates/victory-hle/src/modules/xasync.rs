@@ -227,6 +227,12 @@ impl Queue {
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
+        // A callback still on its delay is pending too: termination invokes
+        // every pending callback with `canceled` set (XTaskQueueTerminate).
+        if self.terminated.load(Ordering::Acquire) {
+            task.run(true);
+            return;
+        }
         self.ports[port as usize].submit(task);
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
@@ -1331,6 +1337,35 @@ mod tests {
         assert_eq!(
             XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)),
             E_ABORT
+        );
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn terminate_cancels_a_callback_still_on_its_delay() {
+        static LATE: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn late(_: *mut c_void, canceled: bool) {
+            LATE.fetch_add(if canceled { 100 } else { 1 }, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 100, std::ptr::null_mut(), Some(late)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueTerminate(q, true, std::ptr::null_mut(), None),
+            S_OK
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !XTaskQueueDispatch(q, WORK, 0),
+            "dispatch ended a terminated queue"
+        );
+        assert_eq!(
+            LATE.load(Ordering::SeqCst),
+            100,
+            "ran as if the queue were live"
         );
         XTaskQueueCloseHandle(q);
     }
