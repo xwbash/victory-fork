@@ -454,7 +454,16 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
-        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        let mut passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        // shortcut: AMD's compiler (amdxc64.dll, RX 9070 XT, Adrenalin
+        // 32.0.32029.2010) crashes at +0x861b9f on the reused values of some
+        // compute programs (#3, #120, #145): without REUSE they compile, with
+        // REUSE alone they crash. Compute programs keep their repeated
+        // instructions until the cause is known; VICTORY_REUSE_ALL=1 keeps
+        // the pass for them.
+        if self.threads.is_some() && std::env::var_os("VICTORY_REUSE_ALL").is_none() {
+            passes &= !super::bitcode::opt::REUSE;
+        }
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
