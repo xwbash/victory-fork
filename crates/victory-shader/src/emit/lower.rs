@@ -177,6 +177,36 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// `s_setreg` hardware register of the pixel ordering unit (POPS packer).
+const HW_REG_POPS_PACKER: u16 = 25;
+/// Source operand code of `src_pops_exiting_wave_id`.
+const POPS_EXITING_WAVE_ID: u8 = 239;
+/// The SGPR after the user data that holds a POPS pixel program's entry word.
+const POPS_WAVE_SGPR: u8 = 18;
+
+/// Whether a pixel program runs part of itself in primitive order (POPS):
+/// it sets the ordering unit's packer register, or reads the exiting wave id.
+///
+/// The console's ordered section: s18 is the collision wave id (bits 9:0 this
+/// wave's id, 25:16 the id the wave must wait behind, 29:28 the packer mode,
+/// bit 31 set when an earlier wave may overlap). The program sets the packer
+/// register, spins until `src_pops_exiting_wave_id` passes the earlier wave's
+/// id, then does its read-modify-write on UAV images. The host's equivalent
+/// is a rasterizer-ordered view, so the program is lowered as the first wave
+/// (s18 is 0: bit 31 clear skips the wait), the packer write is dropped, and
+/// every UAV it opens is marked rasterizer ordered.
+/// shortcut: all UAVs of the program, not only those the section touches.
+fn enters_pops(p: &Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        let Fields::Sop { src, imm, .. } = &i.fields else {
+            return false;
+        };
+        (matches!(i.name(), "s_setreg_imm32_b32" | "s_setreg_b32")
+            && imm.is_some_and(|m| m & 0x3F == HW_REG_POPS_PACKER))
+            || src.iter().any(|o| matches!(o, Operand::Const(POPS_EXITING_WAVE_ID)))
+    })
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -220,6 +250,8 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// A pixel program with a primitive-ordered section ([`enters_pops`]).
+    pops: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -1609,6 +1641,8 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let pops = x.native.stage == HwStage::Ps && enters_pops(p);
+        s.rov = pops;
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -1883,6 +1917,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            pops,
             src0: None,
             console_lanes,
             split_lds,
@@ -2556,6 +2591,9 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // The primitive-ordered section's entry word (`enters_pops`):
+                    // zero is "no earlier wave to wait for".
+                    None if n == POPS_WAVE_SGPR && self.pops => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3415,6 +3453,8 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // Read only by the wait that a zero entry word skips ([`enters_pops`]).
+            Operand::Const(POPS_EXITING_WAVE_ID) if self.pops => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -5272,6 +5312,14 @@ impl<'a> Lower<'a> {
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
+        }
+        if self.pops
+            && matches!(name, "s_setreg_imm32_b32" | "s_setreg_b32")
+            && imm.is_some_and(|i| i & 0x3F == HW_REG_POPS_PACKER)
+        {
+            // The packer takes the wave's place in the ordering; the host's
+            // rasterizer-ordered UAVs give that order ([`enters_pops`]).
+            return Ok(());
         }
         if matches!(
             name,
