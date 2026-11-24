@@ -552,6 +552,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        // The title's views of these pages show new bytes with no fault of
+        // theirs: the guard over them is told (`victory_gpu`).
+        victory_gpu::title_memory_written(slice.section.0 as usize, (slice.index * PAGE + within) as u64, k);
         (within, done) = (0, done + k);
     }
     true
@@ -564,12 +567,21 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    /// The section the bytes lie in, and their offset in it.
+    section: usize,
+    offset: u64,
 }
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
         &mut self.view.bytes()[within..within + len]
+    }
+
+    /// The bytes were written (or the write was tried): the title's views
+    /// of them are told (`victory_gpu`), as [`write_physical`] tells.
+    pub(crate) fn written(&self) {
+        victory_gpu::title_memory_written(self.section, self.offset, self.len);
     }
 }
 
@@ -583,10 +595,13 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let within = offset % PAGE;
     Some(PageWindow {
         view: View::map(slice, *n)?,
-        within: offset % PAGE,
+        within,
         len,
+        section: slice.section.0 as usize,
+        offset: (slice.index * PAGE + within) as u64,
     })
 }
 
