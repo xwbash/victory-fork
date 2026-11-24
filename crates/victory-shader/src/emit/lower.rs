@@ -1634,7 +1634,9 @@ impl<'a> Lower<'a> {
                 || !x.st.wide.is_empty();
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
-            let one_wave = group <= wave;
+            // A 1-thread group has no peers sharing LDS without barriers, so it
+            // does not need a fixed WaveSize (which 64-only GCN GPUs and WARP refuse).
+            let one_wave = group > 1 && group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
@@ -12137,5 +12139,49 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn single_thread_lds_omits_wave_size() {
+        // v_mov_b32 v5, 0; ds_write_b32 v5, v1; s_endpgm
+        let words: &[u32] = &[
+            0x7E0A_0280,
+            0xD834_0000,
+            0x0000_0105,
+            0xBF81_0000,
+        ];
+        let lower_lds = |threads: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: Vec::new(),
+                used: Vec::new(),
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 15, // 512 bytes of LDS
+                    threads: [threads, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            let st = crate::structure::structure(&p).expect("structure");
+            let res =
+                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+            let io = crate::io::raise(&p, &native).expect("io::raise");
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .expect("lower")
+        };
+        assert_eq!(lower_lds(1).wave_size, None);
+        assert_eq!(lower_lds(2).wave_size, Some(32));
     }
 }
