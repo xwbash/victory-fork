@@ -18,6 +18,12 @@
 //! space and on the screen, whatever the interpolation mode); three that
 //! differ in w, or are not such corners, stay the triangle they make.
 //!
+//! "Same" is within `RECT_TOLERANCE` of the first vertex's w, not bit for
+//! bit: a vertex shader that computes each corner (a scale and an offset per
+//! vertex) leaves them a few bits apart, and with exact equality such a
+//! rectangle stayed one triangle – half of it, cut along its diagonal. The
+//! tolerance is under a fifth of a pixel at 3840 pixels across.
+//!
 //! Flat values are the first vertex's: both triangles start with it (the
 //! halves on either side of the diagonal through it, turning as the three
 //! vertices do), which is the vertex the host takes a flat input from, and
@@ -145,6 +151,9 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
     );
     let zero = s.m.f32(0);
     let mut plain = s.m.cmp(b, pred::OGT, w[0], zero);
+    let scale = s.m.f32(RECT_TOLERANCE.to_bits());
+    let tol = s.m.bin(b, Bin::Mul, w[0], scale);
+    let same = |s: &mut Shader, a: V, c: V| close(s, a, c, tol);
     for &other in &w[1..] {
         let one_w = same(&mut s, other, w[0]);
         plain = both(&mut s, plain, one_w);
@@ -258,10 +267,20 @@ fn load(s: &mut Shader, id: usize, col: u8, vertex: u32) -> V {
     s.op(entry, name, Attr::ReadNone, ty, 4, &args)
 }
 
-/// Two floats are equal.
-fn same(s: &mut Shader, a: V, b: V) -> V {
+/// Corners closer than this times the first vertex's w are the same (see the
+/// module docs).
+const RECT_TOLERANCE: f32 = 1.0e-4;
+
+/// Two floats are within `tol` of each other (`tol` ≥ 0; a negative or NaN
+/// `tol` makes nothing close).
+fn close(s: &mut Shader, a: V, b: V, tol: V) -> V {
     let entry = s.entry;
-    s.m.cmp(entry, pred::OEQ, a, b)
+    let d = s.m.bin(entry, Bin::Sub, a, b);
+    let zero = s.m.f32(0);
+    let neg = s.m.bin(entry, Bin::Sub, zero, tol);
+    let below = s.m.cmp(entry, pred::OLE, d, tol);
+    let above = s.m.cmp(entry, pred::OGE, d, neg);
+    both(s, below, above)
 }
 
 fn both(s: &mut Shader, a: V, b: V) -> V {
@@ -450,6 +469,9 @@ mod tests {
             ("corner first", [(-1.0, 1.0), (-1.0, -1.0), (1.0, 1.0)]),
             ("corner second", [(-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)]),
             ("corner third", [(-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]),
+            // corners a few bits apart, as a vertex shader computing each one
+            // leaves them: still the whole rectangle, not the half of it
+            ("corner second, a few bits apart", [(-1.0, 1.0), (-1.00001, -1.0), (1.0, -0.99999)]),
         ] {
             let vertices = corners.map(vertex).concat();
             let draw = |gs: Option<&[u8]>| {
