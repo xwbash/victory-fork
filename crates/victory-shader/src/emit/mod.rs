@@ -1619,6 +1619,11 @@ mod barycentric_tests {
         pixel_with(words, input_addr, false)
     }
 
+    /// The same helper under the name PR #52's tests use.
+    fn pixel_with_half(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
+        pixel_with(words, input_addr, fp16)
+    }
+
     /// `pixel`, with TEXCOORD0 held as 16-bit values when `fp16`.
     fn pixel_with(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
@@ -1651,9 +1656,9 @@ mod barycentric_tests {
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-        let res = resource::track(&p, &native.layout, native.stage, None)?;
-        let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
         emit(&c, &native, &p, &st, &io, &res)
     }
 
@@ -1755,6 +1760,235 @@ mod barycentric_tests {
         ];
         let shader = pixel_with(&words, PERSP_CENTER, true).unwrap();
         validate(&shader);
+    }
+
+    #[test]
+    fn a_standalone_first_half_reads_the_vertices() {
+        let shader = first_half_pixel(false);
+        let (_, inputs) = parts(&shader);
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    #[test]
+    fn a_dead_first_half_overwritten_by_a_move_adds_no_barycentrics() {
+        let [e0, e1] = exp_mrt0(3);
+        for use_zero in [false, true] {
+            let mut words = vec![
+                0xC808_0000, // dead p1 in v2
+                0x7E04_0280, // v_mov_b32 v2, 0, with entry EXEC unchanged
+                0xC80C_0000, // ordinary p1/p2 in v3 of the same attribute
+                0xC80D_0001,
+            ];
+            if use_zero {
+                words.push(v_add_f32(3, 3, 2));
+            }
+            words.extend([e0, e1, S_ENDPGM]);
+            let shader = pixel(&words, PERSP_CENTER).unwrap();
+            let (features, inputs) = parts(&shader);
+            assert_eq!(features & 0x2_0000, 0);
+            assert!(inputs.iter().all(|e| e.kind != 28));
+            assert_ne!(texcoord_mode(&shader), 1);
+            validate(&shader);
+        }
+    }
+
+    #[test]
+    fn a_masked_move_keeps_the_first_half_outside_exec() {
+        let [e0, e1] = exp_mrt0(2);
+        let shader = pixel(
+            &[
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0x7C02_0300, // v_cmp_lt_f32 vcc, v0, v1
+                0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBEFE_0306, // s_mov_b32 exec_lo, s6
+                e0,
+                e1,
+                S_ENDPGM,
+            ],
+            PERSP_CENTER,
+        )
+        .unwrap();
+        let (features, _) = parts(&shader);
+        assert_ne!(features & 0x2_0000, 0);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    #[test]
+    fn a_first_half_read_beside_its_pair_keeps_its_partial_value() {
+        let shader = first_half_pixel(true);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    fn first_half_pixel(paired: bool) -> HostShader {
+        let [e0, e1] = exp_mrt0(2);
+        let mut words = vec![0xC808_0000]; // v_interp_p1_f32 v2, v0, attr0.x
+        if paired {
+            words.extend([
+                0x7E06_0302, // v_mov_b32 v3, v2 (keep the partial value)
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                v_add_f32(2, 2, 3),
+            ]);
+        }
+        words.extend([e0, e1, 0xBF81_0000]);
+        pixel(&words, PERSP_CENTER).unwrap()
+    }
+
+    fn first_half_high_word_pixel() -> HostShader {
+        let [e0, e1] = exp_mrt0(2);
+        pixel_with_half(
+            &[
+                0xD742_0002, 0x0002_0000, // p1ll v2, v0, attr0.x: old destination
+                0xD742_0003, 0x0002_0000, // p1ll v3, v0, attr0.x: pair accumulator
+                0xD75A_0002, 0x040E_0200, // p2_f16 v2, attr0.x, v1, v3
+                e0, e1, S_ENDPGM,
+            ],
+            PERSP_CENTER,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_folded_f16_pair_preserves_the_old_destination_high_word() {
+        let shader = first_half_high_word_pixel();
+        assert_ne!(parts(&shader).0 & 0x2_0000, 0);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn first_half_values_render_on_hardware_and_warp() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Pass POSITION and TEXCOORD through, with TEXCOORD in the same
+        // output row as the translated pixel shader's input signature.
+        let mut s = Shader::new(false);
+        s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+        for e in &mut s.inputs {
+            e.usage = 15;
+        }
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        for (i, e) in s.outputs.iter_mut().enumerate() {
+            e.usage = 15;
+            e.interp = if i == 1 { 4 } else { 2 };
+        }
+        for row in 0..2 {
+            for col in 0..4 {
+                let args = [s.m.i32(row), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                let args = [s.m.i32(1 - row), s.m.i32(0), s.m.i8(col), v];
+                s.op(
+                    s.entry,
+                    "storeOutput.f32",
+                    Attr::NoUnwind,
+                    s.t.void,
+                    5,
+                    &args,
+                );
+            }
+        }
+        s.m.terminate(s.entry, Term::Ret);
+        let vs = HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        validate(&vs);
+        // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
+        let vertices = [
+            -1.0, 1.0, 0.5, 1.0, 2.0, 0.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 6.0, 0.0, 0.0, 0.0, 3.0,
+            1.0, 0.5, 1.0, 10.0, 0.0, 0.0, 0.0,
+        ];
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let mut options =
+                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: a correctly sized output for the feature query.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .unwrap();
+            }
+            if !options.BarycentricsSupported.as_bool() {
+                eprintln!("no barycentrics on {backend}; skipped");
+                continue;
+            }
+            for case in 0..3 {
+                let ps = if case == 2 {
+                    first_half_high_word_pixel()
+                } else {
+                    first_half_pixel(case == 1)
+                };
+                validate(&ps);
+                let (root, pso) = host.pipeline(&vs, &ps).expect("interpolation pipeline");
+                let out = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: 32,
+                            size: (8, 8),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .expect("draw partial interpolation");
+                for (n, texel) in out.iter().enumerate() {
+                    let i = (n / 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let j = (n % 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let partial = 2.0 + i * 4.0;
+                    let want = if case == 1 {
+                        partial + 2.0 + i * 4.0 + j * 8.0
+                    } else {
+                        partial
+                    };
+                    for &got in texel {
+                        if case == 2 {
+                            let full = 2.0 + i * 4.0 + j * 8.0;
+                            // Every value in this fixture is exactly representable in f16.
+                            let bits = full.to_bits();
+                            let half = (((bits >> 23) - 112) << 10) | ((bits >> 13) & 0x3ff);
+                            let expected = (partial.to_bits() & 0xffff_0000) | half;
+                            assert_eq!(got.to_bits(), expected, "{backend} f16 pixel={n}");
+                            continue;
+                        }
+                        assert!(
+                            (got - want).abs() < 1e-5,
+                            "{backend} case={case} pixel={n}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+            ran += 1;
+            eprintln!("partial interpolation renders correctly on {backend}");
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 host with barycentrics; GPU checks skipped");
+        }
     }
 
     /// Both: the attribute is interpolated and J is used as a value.
