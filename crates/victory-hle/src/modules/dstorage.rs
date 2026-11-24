@@ -420,7 +420,8 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers =
+            dstorage_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -432,6 +433,12 @@ fn scheduler() -> Option<&'static Scheduler> {
         tracing::info!(workers = started, "dstorage: workers");
     });
     Some(scheduler)
+}
+
+/// Number of DirectStorage I/O and decompression workers for a machine with
+/// `cores` logical processors.
+fn dstorage_worker_count(cores: usize) -> usize {
+    cores.clamp(2, 16)
 }
 
 impl Scheduler {
@@ -1625,5 +1632,15 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn dstorage_worker_count_scales_with_cores() {
+        assert_eq!(dstorage_worker_count(2), 2);
+        assert_eq!(dstorage_worker_count(4), 4);
+        assert_eq!(dstorage_worker_count(8), 8);
+        assert_eq!(dstorage_worker_count(16), 16);
+        assert_eq!(dstorage_worker_count(28), 16);
+        assert_eq!(dstorage_worker_count(64), 16);
     }
 }

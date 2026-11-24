@@ -299,12 +299,19 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Number of background pipeline compile workers for a machine with `cores`
+/// logical processors.
+fn pipeline_worker_count(cores: usize) -> usize {
+    (cores / 2).clamp(2, 12)
+}
+
+/// Starts the workers (half the logical processors, 2 to 12) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers =
+            pipeline_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -402,5 +409,15 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn pipeline_worker_count_scales_with_cores() {
+        assert_eq!(pipeline_worker_count(2), 2);
+        assert_eq!(pipeline_worker_count(4), 2);
+        assert_eq!(pipeline_worker_count(8), 4);
+        assert_eq!(pipeline_worker_count(16), 8);
+        assert_eq!(pipeline_worker_count(28), 12);
+        assert_eq!(pipeline_worker_count(64), 12);
     }
 }

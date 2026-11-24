@@ -1021,6 +1021,12 @@ mod difference_tests {
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
 
+/// Maximum number of threads [`copy_wide`] may fan out to for a machine with
+/// `cores` logical processors.
+fn copy_wide_max_jobs(cores: usize) -> usize {
+    (cores / 2).clamp(1, 8)
+}
+
 /// Copies `len` bytes, on several threads if they are many: a snapshot of
 /// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
 /// one thread copies some 8 GB/s.
@@ -1029,7 +1035,11 @@ const PIECE: usize = 64 << 10;
 /// Both ranges are valid for `len` bytes and do not overlap.
 unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
     const PER_THREAD: usize = 16 << 20;
-    let threads = (len / PER_THREAD).clamp(1, 6);
+    static MAX_JOBS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let max_jobs = *MAX_JOBS.get_or_init(|| {
+        copy_wide_max_jobs(std::thread::available_parallelism().map_or(4, |n| n.get()))
+    });
+    let threads = (len / PER_THREAD).clamp(1, max_jobs);
     if threads == 1 {
         // SAFETY: the caller's.
         unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
@@ -1083,6 +1093,12 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+/// Number of kept worker threads for [`wide`] on a machine with `cores`
+/// logical processors.
+fn wide_worker_count(cores: usize) -> usize {
+    (cores / 4).clamp(1, 8)
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1091,7 +1107,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -3302,6 +3318,31 @@ mod window_tests {
         assert_eq!(super::snapshot_pool_cap(Some(16 * GIB)), 512 * MIB);
         assert_eq!(super::snapshot_pool_cap(Some(32 * GIB)), 1024 * MIB);
         assert_eq!(super::snapshot_pool_cap(Some(64 * GIB)), 1024 * MIB);
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::{copy_wide_max_jobs, wide_worker_count};
+
+    #[test]
+    fn copy_wide_max_jobs_scales_with_cores() {
+        assert_eq!(copy_wide_max_jobs(2), 1);
+        assert_eq!(copy_wide_max_jobs(4), 2);
+        assert_eq!(copy_wide_max_jobs(8), 4);
+        assert_eq!(copy_wide_max_jobs(16), 8);
+        assert_eq!(copy_wide_max_jobs(28), 8);
+        assert_eq!(copy_wide_max_jobs(64), 8);
+    }
+
+    #[test]
+    fn wide_worker_count_scales_with_cores() {
+        assert_eq!(wide_worker_count(2), 1);
+        assert_eq!(wide_worker_count(4), 1);
+        assert_eq!(wide_worker_count(8), 2);
+        assert_eq!(wide_worker_count(16), 4);
+        assert_eq!(wide_worker_count(28), 7);
+        assert_eq!(wide_worker_count(64), 8);
     }
 }
 
