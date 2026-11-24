@@ -437,6 +437,22 @@ macro_rules! once {
     }};
 }
 
+/// Bounds a direct dispatch to the limits also enforced for indirect ones.
+fn direct_dispatch_allowed(x: u32, y: u32, z: u32) -> bool {
+    const MAX_GROUPS_PER_DIMENSION: u32 = 65_535;
+    const MAX_GROUPS_PER_DISPATCH: u64 = 1 << 20;
+    if x > MAX_GROUPS_PER_DIMENSION
+        || y > MAX_GROUPS_PER_DIMENSION
+        || z > MAX_GROUPS_PER_DIMENSION
+    {
+        return false;
+    }
+    u64::from(x)
+        .checked_mul(u64::from(y))
+        .and_then(|xy| xy.checked_mul(u64::from(z)))
+        .is_some_and(|groups| groups <= MAX_GROUPS_PER_DISPATCH)
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1730,6 +1746,24 @@ impl State {
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            return;
+        }
+        if !direct_dispatch_allowed(x, y, z) {
+            once!(
+                groups = format_args!("{x}x{y}x{z}"),
+                "a direct compute dispatch exceeds host work limits and is dropped"
+            );
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_why(format!(
+                    "direct dispatch {x}x{y}x{z} exceeds host work limits"
+                ));
+                self.list_dropped_roots([x, y, z]);
+            }
+            if crate::pipeline::is_builder(self.pipeline as This) {
+                crate::pipeline::builder_off("a direct dispatch exceeded host work limits");
+            }
             return;
         }
         if !self.bind(list, p, true) {
