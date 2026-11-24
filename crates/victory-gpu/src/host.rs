@@ -5869,7 +5869,13 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        over: Option<(&ID3D12Resource, u32)>,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -5952,14 +5958,58 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            // The present's second plane, if it has one, goes over the copy
+            // ([`crate::over`]): the back buffer is a target meanwhile.
+            let readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            let over = over.and_then(|(plane, was)| {
+                // SAFETY: a live resource.
+                let format = swap_format(plane.GetDesc().Format)?;
+                Some((plane, D3D12_RESOURCE_STATES(was as i32), format))
+            });
+            let mut drawn = false;
+            if let Some((plane, was, plane_format)) = over {
+                let mut barriers = vec![
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    ),
+                ];
+                let moved = was.0 & readable.0 == 0;
+                if moved {
+                    barriers.push(transition(plane, was, readable));
+                }
+                list.ResourceBarrier(&barriers);
+                drawn = crate::over::record(
+                    &self.device,
+                    list,
                     &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    format,
+                    (width, height),
+                    plane,
+                    plane_format,
+                );
+                let mut barriers = vec![transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )];
+                if moved {
+                    barriers.push(transition(plane, readable, was));
+                }
+                list.ResourceBarrier(&barriers);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
+            let _ = drawn;
             copy.close();
             match slot {
                 Some(i) => {

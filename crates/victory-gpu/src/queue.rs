@@ -828,7 +828,27 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // A second plane (the title's interface over its game image, in
+        // its Series S mode) is drawn over the first: `crate::over`. Each
+        // plane's description is 0x48 bytes and starts as the first does.
+        const READABLE: u32 = 0x80;
+        let second = (planes > 1)
+            // SAFETY: the title passes `planes` plane descriptions.
+            .then(|| unsafe { plane_parameters.cast::<u8>().add(0x48).cast::<Plane>().as_ref() })
+            .flatten()
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|p| unsafe { *p.resources })
+            .filter(|&r| r != resource)
+            .and_then(|r| Some((r, crate::resource::host_resource(r)?)));
+        let over = second.map(|(r, t)| {
+            let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
+            (r, t, was)
+        });
+        let shown = host.present(texture, state, frame, over.map(|(_, t, was)| (t, was)));
+        if let Some((r, _, was)) = over {
+            crate::resource::host_transition(r, was);
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

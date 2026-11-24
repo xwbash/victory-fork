@@ -775,6 +775,46 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 
+/// Stands in for the console upscaler's dispatch on title list `this`:
+/// `output` gets the stretched top-left `render` texels of `colour`
+/// ([`crate::over`]). False if nothing was recorded (no host GPU, textures
+/// we do not hold, an output shaders cannot write).
+///
+/// The real dispatch leaves its own state in the list, so the title sets
+/// its own again afterwards; ours is replayed all the same.
+#[cfg(windows)]
+pub fn upscale_stretch(
+    this: *const std::ffi::c_void,
+    colour: *const std::ffi::c_void,
+    output: *const std::ffi::c_void,
+    render: [u32; 2],
+) -> bool {
+    const SHADER_READ: u32 = 0x40;
+    const UNORDERED: u32 = 0x8;
+    let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
+    if this.is_null() || colour.is_null() || output.is_null() {
+        return false;
+    }
+    let mut done = false;
+    with_state(this, |list, state| {
+        let (Some(to), Some(from), Some(host)) = (
+            crate::resource::host_resource(output),
+            crate::resource::host_resource(colour),
+            crate::host::host(),
+        ) else {
+            return;
+        };
+        ensure_state(list, colour, SHADER_READ);
+        ensure_state(list, output, UNORDERED);
+        done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
+        if done {
+            crate::texture::host_written(output);
+        }
+        state.replay(list);
+    });
+    done
+}
+
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
