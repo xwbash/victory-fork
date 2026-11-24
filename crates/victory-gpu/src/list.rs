@@ -714,11 +714,19 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             } else {
                 // A depth texture's unordered access is its colour twin's
                 // (the host gives the depth texture none): the barrier is
-                // on the texture shaders write.
-                match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
-                    None => host(b.first)?,
+                // on the texture shaders write. Skip UAV barriers on host
+                // textures whose ALLOW_UNORDERED_ACCESS flag was dropped
+                // (unsupported format), avoiding id=523 / E_INVALIDARG.
+                let res = match crate::resource::twin_resource(b.first) {
+                    Some(twin) => twin,
+                    None => crate::resource::host_resource(b.first)?,
+                };
+                // SAFETY: a live D3D12 resource.
+                let flags = unsafe { res.GetDesc() }.Flags.0 as u32;
+                if flags & 0x4 == 0 {
+                    return None;
                 }
+                res.as_raw().cast_const().cast()
             },
             ..*b
         }),
@@ -1221,7 +1229,9 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(Some(texture), record.desc().as_ref());
+        let Some(rtv) = host.rtv(Some(texture), record.desc().as_ref()) else {
+            return;
+        };
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {

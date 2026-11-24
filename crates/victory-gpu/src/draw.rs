@@ -531,15 +531,20 @@ impl State {
                 let null = record
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                if let Some(desc) = null
+                    && let Some(rtv) = host.rtv(None, Some(&desc))
+                {
+                    rtvs.push(rtv);
                 }
+                continue;
+            };
+            let Some(rtv) = host.rtv(Some(texture), record.desc().as_ref()) else {
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            rtvs.push(rtv);
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;

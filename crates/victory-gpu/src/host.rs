@@ -4340,12 +4340,20 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host render target view of `resource`, valid until it is recorded,
+    /// or `None` if the host resource lacks `ALLOW_RENDER_TARGET`.
     pub(crate) fn rtv(
         &self,
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        if let Some(res) = resource {
+            // SAFETY: a live resource.
+            let flags = unsafe { res.GetDesc() }.Flags;
+            if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+                return None;
+            }
+        }
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
@@ -4354,7 +4362,7 @@ impl Host {
             handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
+            Some(handle)
         }
     }
 
