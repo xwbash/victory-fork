@@ -16,6 +16,11 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with(words, buffers, 1)
+}
+
+/// [`build`] for a program with `nonuniform` per-lane handles.
+fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -72,8 +77,9 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+    assert_eq!(lowered.nonuniform_handles, nonuniform);
+    // (Without an access to prove the loop a waterfall, its first-lane read is a wave operation.)
+    assert_eq!(lowered.wave_ops, nonuniform == 0);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -247,5 +253,52 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
+    }
+}
+/// `v_alignbit_b32 v1, s14, s13, 30`, which is the width - 1 and, from bit
+/// 16, the height - 1 of the image descriptor's dwords 1 and 2.
+const WATERFALL_SIZE_ONLY_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0A02,
+    0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    0x360E_0081, // v_and_b32 v7, 1, v0
+    0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBE97_037E, // s_mov_b32 s23, exec_lo
+    0xBE95_037E, // s_mov_b32 s21, exec_lo
+    0x7E28_0507, // 0x20: v_readfirstlane_b32 s20, v7
+    0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+    0xF40C_0302,
+    0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD54E_0001,
+    0x0278_1A0E, // v_alignbit_b32 v1, s14, s13, 30
+    0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+    0xBF89_FFF7, // s_cbranch_execnz -> 0x20
+    0xBEFE_0317, // s_mov_b32 exec_lo, s23
+    0xE070_1000,
+    0x800A_0110, // buffer_store_dword v1, v16, s[40:43], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_descriptor_only_read_as_data_gives_its_views_size() {
+    // Without a use no instruction names the view's kind; the table's range
+    // does (an image: taken for 2D). The lowering used to refuse.
+    let shader = build_with(WATERFALL_SIZE_ONLY_WAVE32, false, 0);
+    let (a, b) = ([[0.0f32; 4]; 8 * 4], [[0.0f32; 4]; 4 * 2]);
+    let views = [
+        View::Texture(8, 4, &a),
+        View::Texture(4, 2, &b),
+        View::RawUav(32),
+    ];
+    for (label, got) in run(&shader, &views) {
+        // Even lanes hold entry 0's offset (8 x 4), odd lanes entry 1's (4 x 2).
+        let want: Vec<u32> = (0..32)
+            .map(|l| if l & 1 == 0 { 7 | 3 << 16 } else { 3 | 1 << 16 })
+            .collect();
+        assert_eq!(got, want, "{label}");
     }
 }
