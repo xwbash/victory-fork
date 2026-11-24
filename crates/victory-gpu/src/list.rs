@@ -1674,6 +1674,14 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// The bytes left in the named resource after a valid indirect buffer offset.
+fn indirect_range((base, size): (u64, u64), offset: u64, len: u64) -> Option<std::ops::Range<u64>> {
+    if !offset.is_multiple_of(4) || len > size.checked_sub(offset)? {
+        return None;
+    }
+    Some(base.checked_add(offset)?..base.checked_add(size)?)
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1696,24 +1704,28 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let len = u64::from(stride) * u64::from(max.max(1));
+    let argument_range = crate::resource::buffer_bytes(arguments)
+        .and_then(|(p, size)| indirect_range((p as u64, size), offset, len));
+    let counter = crate::resource::buffer_bytes(count)
+        .and_then(|(p, size)| indirect_range((p as u64, size), count_offset, 4))
+        .map(|range| range.start);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let ([[kind, ..]], Some(range)) = (args, argument_range.as_ref())
         && (count.is_null() || counter.is_some())
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), range, counter);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
-            address.is_some(),
+            argument_range.is_some(),
             count.is_null() || counter.is_some()
         ));
     }
@@ -1729,7 +1741,7 @@ extern "system" fn execute_indirect(
             stride,
             ?args,
             max,
-            address = ?address.map(|a| format!("{a:#x}")),
+            address = ?argument_range.map(|range| format!("{:#x}", range.start)),
             counted = !count.is_null(),
             "indirect execution dropped (first time for this signature)"
         );
@@ -2177,6 +2189,27 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn indirect_argument_range_stays_in_the_named_buffer() {
+        // The selected buffer ends at 0x1040, even if another resource begins there.
+        assert_eq!(indirect_range((0x1000, 64), 52, 12), Some(0x1034..0x1040));
+        assert_eq!(indirect_range((0x1000, 64), 56, 12), None);
+        assert_eq!(indirect_range((0x1000, 64), 64, 12), None);
+    }
+
+    #[test]
+    fn indirect_count_range_requires_four_aligned_bytes() {
+        assert_eq!(indirect_range((0x2000, 16), 12, 4), Some(0x200c..0x2010));
+        assert_eq!(indirect_range((0x2000, 14), 12, 4), None);
+        assert_eq!(indirect_range((0x2000, 16), 9, 4), None);
+    }
+
+    #[test]
+    fn indirect_range_rejects_address_wraparound() {
+        assert_eq!(indirect_range((0x1000, 64), u64::MAX - 3, 12), None);
+        assert_eq!(indirect_range((u64::MAX - 15, 32), 0, 12), None);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

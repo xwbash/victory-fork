@@ -101,6 +101,38 @@ struct Window {
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
 
+fn window_records(
+    stride: u32,
+    step: u64,
+    desired: u32,
+    argument_bytes: u64,
+    shadow_bytes: u64,
+) -> (u32, u32) {
+    // The host copy can extend beyond the named title buffer.
+    let remaining = argument_bytes.min(shadow_bytes);
+    let fit = (remaining / step).min(WINDOW_MOST) as u32;
+    let records = desired.min(fit);
+    if records > 1 {
+        (step as u32, records)
+    } else {
+        (stride, 1)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn indirect_window_stays_inside_the_named_buffer_and_shadow() {
+    assert_eq!(window_records(12, 32, 16, 64, 4096), (32, 2));
+    assert_eq!(window_records(12, 32, 16, 4096, 64), (32, 2));
+}
+
+#[cfg(test)]
+#[test]
+fn indirect_window_uses_signature_stride_when_only_one_record_fits() {
+    assert_eq!(window_records(12, 32, 16, 12, 12), (12, 1));
+    assert_eq!(window_records(12, 32, 16, 32, 32), (12, 1));
+}
+
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
 /// by default).
@@ -2259,7 +2291,8 @@ impl State {
 impl State {
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
-    /// records `stride` bytes apart at title address `arguments`, and the
+    /// records `stride` bytes apart starting at `arguments.start`, with
+    /// `arguments.end` the end of the title's argument buffer, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
@@ -2267,7 +2300,7 @@ impl State {
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
-        arguments: u64,
+        arguments: &std::ops::Range<u64>,
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
@@ -2323,6 +2356,8 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
+        let argument_bytes = arguments.end - arguments.start;
+        let arguments = arguments.start;
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -2387,8 +2422,14 @@ impl State {
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            let desired = if w.records == 1 { 16 } else { w.records * 2 };
+                            window_records(
+                                stride,
+                                step,
+                                desired,
+                                argument_bytes,
+                                args.left(arguments),
+                            )
                         } else {
                             (stride, max)
                         }
